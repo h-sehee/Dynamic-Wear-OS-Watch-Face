@@ -19,7 +19,7 @@
 
 | Parallax Effect | Configuration | AOD Mode |
 |:---:|:---:|:---:|
-| <img src="docs/parallax_demo.gif" width="150" height="150"/> | <img src="docs/config_screen.png" width="150" height="150"/> | <img src="docs/screenshot_aod.png" width="150" height="150"/> |
+| <img src="docs/parallax_demo.gif" width="150" height="150"/> | <img src="docs/config_screen.gif" width="150" height="150"/> | <img src="docs/screenshot_aod.png" width="150" height="150"/> |
 
 *(Please replace these paths with your actual screenshot files)*
 
