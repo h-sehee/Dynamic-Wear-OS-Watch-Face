@@ -21,8 +21,6 @@
 |:---:|:---:|:---:|
 | <img src="docs/parallax_demo.gif" width="150" height="150"/> | <img src="docs/config_screen.gif" width="150" height="150"/> | <img src="docs/screenshot_aod.png" width="150" height="150"/> |
 
-*(Please replace these paths with your actual screenshot files)*
-
 ## ✨ Key Features
 
 * **2.5D Parallax Effect:** Creates a depth effect by moving background layers and 3D-modeled indices based on **Gyroscope sensor** data.
