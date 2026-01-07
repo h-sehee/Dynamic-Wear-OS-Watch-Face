@@ -1,0 +1,39 @@
+<resources>
+    <string name="app_name">RewindWatch</string>
+
+    <string name="app_description">
+    Rewind Watch Face\n\n
+        Created by 시호\n\n
+    [Credits]\n
+    - Blue Sky Image: <a href="https://www.vecteezy.com/photo/2802526-white-cloud-on-blue-sky">white-cloud-on-blue-sky Stock photos by Vecteezy</a>
+    - Sunset Sky Image: <a href="https://www.vecteezy.com/photo/4877951-beautiful-fluffy-clouds-with-evening-sunset-background">beautiful-fluffy-clouds-with-evening-sunset-background Stock photos by Vecteezy</a>
+    - Dawn Sky Image: <a href="https://unsplash.com/ko/%EC%82%AC%EC%A7%84/%ED%95%B4%EC%A7%88%EB%85%98-%ED%95%98%EB%8A%98%EC%9D%84-%EB%82%98%EB%8A%94-%EB%B9%84%ED%96%89%EA%B8%B0-q1WLDd6t0jQ?utm_source=unsplash&amp;utm_medium=referral&amp;utm_content=creditCopyText">Unsplash</a>의<a href="https://unsplash.com/ko/@eniuquine?utm_source=unsplash&amp;utm_medium=referral&amp;utm_content=creditCopyText">t k</a>
+    - Night Sky Image: <a href="https://unsplash.com/ko/%EC%82%AC%EC%A7%84/%EB%A1%9C%ED%82%A4%EC%82%B0%EB%A7%A5-%EA%B5%AD%EB%A6%BD%EA%B3%B5%EC%9B%90%EC%97%90%EC%84%9C-%EB%B3%B8-%EB%B3%84%EA%B3%BC-%EC%9D%80%ED%95%98-4dpAqfTbvKA?utm_source=unsplash&amp;utm_medium=referral&amp;utm_content=creditCopyText">Unsplash</a>의<a href="https://unsplash.com/ko/@jeremythomasphoto?utm_source=unsplash&amp;utm_medium=referral&amp;utm_content=creditCopyText">Jeremy Thomas</a>
+    - Rain Animation: <a href="https://www.vecteezy.com/video/22919629-realistic-3d-rain-fall-effect-on-glass-with-green-background-rain-falling-on-glass-green-screen-rain-drops-loop-animation-background-of-rain-drops-falling-video">realistic-3d-rain-fall-effect-on-glass-with-green-background-rain-falling-on-glass-green-screen-rain-drops-loop-animation-background-of-rain-drops-falling-video Stock Videos by Vecteezy</a>
+    - Snow Animation: <a href="https://www.vecteezy.com/video/2021818-falling-snow-isolated-on-a-black-background">falling-snow-isolated-on-a-black-background Stock Videos by Vecteezy</a>
+    - Powered by OpenWeatherMap
+</string>
+
+    <string name="config_time_title">Time</string>
+    <string name="config_seconds_title">Seconds</string>
+    <string name="config_date_title">Date</string>
+    <string name="config_battery_title">Battery</string>
+    <string name="config_weather_title">Weather Animation</string>
+    <string name="config_font_style_title">Font Style</string>
+    <string name="config_font_weight_title">Font Weight</string>
+
+    <string name="font_style_sans">Standard</string>
+    <string name="font_style_serif">Serif</string>
+    <string name="font_style_mono">Mono</string>
+    <string name="font_style_condensed">Condensed</string>
+
+    <string name="font_weight_normal">Normal</string>
+    <string name="font_weight_medium">Medium</string>
+    <string name="font_weight_bold">Bold</string>
+    <string name="font_weight_extrabold">ExtraBold</string>
+    <!--
+    This string is used for square devices and overridden by hello_world in
+    values-round/strings.xml for round devices.
+    -->
+    <string name="hello_world">From the Square world,\nHello, %1$s!</string>
+</resources>
