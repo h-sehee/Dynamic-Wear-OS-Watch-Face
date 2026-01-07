@@ -9,9 +9,9 @@
 
 ## 📱 Screenshots
 
-| Interactive Mode (Dawn, Day, Sunset, Night) | Parallax Effect (GIF) | Configuration | AOD Mode |
+| Dawn | Day | Sunset | Night | Parallax Effect | Configuration | AOD Mode |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| <img src="docs/screenshot_dawn.png" width="200"/> | <img src="docs/screenshot_day.png" width="200"/> | <img src="docs/screenshot_sunset.png" width="200"/> | <img src="docs/screenshot_night.png" width="200"/> | <img src="docs/parallax_demo.gif" width="200"/> | <img src="docs/config_screen.png" width="200"/> | <img src="docs/screenshot_aod.png" width="200"/> |
+| <img src="docs/screenshot_dawn.png" width="200"/> | <img src="docs/screenshot_day.png" width="200"/> | <img src="docs/screenshot_sunset.png" width="200"/> | <img src="docs/screenshot_night.png" width="200"/> | <img src="docs/parallax_demo.gif" width="200"/> | <img src="docs/config_screen.gif" width="200"/> | <img src="docs/screenshot_aod.png" width="200"/> |
 
 *(Please replace these paths with your actual screenshot files)*
 
