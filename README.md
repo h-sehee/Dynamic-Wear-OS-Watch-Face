@@ -56,21 +56,6 @@
 * Pre-allocated all `Paint` and `Bitmap` objects during initialization.
 * Implemented a reuse strategy for scaled bitmaps to minimize memory churn.
 
-## ⚙️ Setup & Installation
-
-This project uses **OpenWeatherMap API**. You need to set up your API key locally.
-
-1.  Clone this repository.
-    ```bash
-    git clone [https://github.com/YOUR_USERNAME/RewindWatch.git](https://github.com/YOUR_USERNAME/RewindWatch.git)
-    ```
-2.  Open the project in Android Studio.
-3.  Create a `local.properties` file in the root directory (if not exists) and add your API key:
-    ```properties
-    weatherApiKey=YOUR_OPENWEATHERMAP_API_KEY_HERE
-    ```
-4.  Build and run on your Wear OS emulator or physical device.
-
 ## 📂 Project Structure
 
 ```
