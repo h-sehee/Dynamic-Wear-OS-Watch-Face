@@ -26,8 +26,10 @@
 * **2.5D Parallax Effect:** Creates a depth effect by moving background layers and 3D-modeled indices based on **Gyroscope sensor** data.
 * **Dynamic Weather Backgrounds:** Automatically changes the background (Clear, Rain, Snow, Dawn, Sunset, Night) based on **OpenWeatherMap API** data and local time.
 * **Custom 3D Assets:** High-quality watch hands and indices modeled directly in **Blender**.
-* **User Customization:** Toggle visibility for Time, Date, and Battery via a custom **Configuration Activity**.
-* **Always-On Display (AOD):** Supports low-power ambient mode with burn-in protection logic.
+* **User Customization:** Toggle visibility for Time, Date, and Battery and pick font style / weight via a custom **Configuration Activity**.
+* **Always-On Display (AOD):** Supports low-power ambient mode with a 4-minute pixel-shift cycle for OLED burn-in defense.
+* **Bilingual UI:** Auto-switches between **Korean** and **English** based on the watch's system locale.
+* **Smart Permission Flow:** Launches a status screen on first app-drawer tap to request runtime location permission, with a clear fallback message when denied.
 
 ## 🛠 Tech Stack
 
@@ -56,6 +58,30 @@
 * Pre-allocated all `Paint` and `Bitmap` objects during initialization.
 * Implemented a reuse strategy for scaled bitmaps to minimize memory churn.
 
+### 3. Display Quality
+**Issue:** Index/bezel bitmaps appeared blurry-zoomed on first launch and after bounds changes (e.g., returning from the editor). Backgrounds were stretched into a non-square aspect, causing inconsistent parallax framing.
+
+**Solution:**
+* Removed unnecessary `inSampleSize` downsampling for the fixed-size 500×500 index/hand assets so they're loaded at full resolution.
+* Kept **unscaled originals in dedicated `*Src` fields** and resampled from them on every bounds change, preventing compounded scale loss.
+* **Center-cropped** background bitmaps into a deterministic square so parallax offsets are consistent every time.
+
+### 4. Battery & Burn-in Defense
+**Issue:** Interactive mode redrew at 60 FPS regardless of motion, and the accelerometer listener invalidated on every sensor event (~50 Hz). In AOD, the same pixels stayed lit for hours, risking OLED burn-in.
+
+**Solution:**
+* Lowered the interactive renderer's baseline tick from **16 ms (60 FPS) to 1000 ms (1 FPS)**; the sensor listener now triggers `invalidate()` only when tilt changes meaningfully (>0.05) and is throttled to ~30 Hz.
+* Added a **4-minute pixel-shift cycle** (1 px on a `(0,0) → (1,0) → (1,1) → (0,1)` pattern) to the AOD draw path so the same pixels don't stay lit indefinitely.
+
+### 5. Weather Fetch Robustness
+**Issue:** Network/permission failures were silent, and `solarSchedule` (sunrise/sunset) defaulted to `now ± offset` at watch-face start time, leading to incorrect sky states (e.g., night background in the morning) when the API failed.
+
+**Solution:**
+* Added `Log.w` / `Log.e` on all failure paths (HTTP non-200, exceptions, missing API key, permission denied) so issues are diagnosable from `adb logcat -s RewindWatch:*`.
+* Built-in **60-second retry** after a failed fetch instead of waiting the full 30-minute cycle.
+* Fallback `solarSchedule` now anchors to **today's 06:00 / 18:00** in the system zone instead of an offset from "now".
+* Asymmetric **DAWN (-30 / +15 min)** and **SUNSET (-45 / +20 min)** windows that match how people actually perceive the transitions.
+
 ## 📂 Project Structure
 
 ```
@@ -70,7 +96,9 @@ RewindWatch/
 │   │   │   └── theme/
 │   │   └── res/
 │   │       ├── drawable/             # 3D Assets (Watch Hands, Indices) & Dynamic Backgrounds
-│   │       ├── values/strings.xml
+│   │       ├── values/strings.xml    # Default labels (English)
+│   │       ├── values-ko/strings.xml # Korean labels (auto-selected on Korean locale)
+│   │       ├── values-round/strings.xml
 │   │       └── xml/watch_face.xml    # Watch Face Metadata
 │   └── build.gradle.kts
 ├── gradle/libs.versions.toml         # Centralized dependency versions
