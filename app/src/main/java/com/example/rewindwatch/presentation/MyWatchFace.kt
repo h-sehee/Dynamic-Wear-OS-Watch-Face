@@ -60,6 +60,8 @@ data class SolarSchedule(val sunrise: Long, val sunset: Long)
 class MyWatchFace : WatchFaceService() {
 
     companion object {
+        private const val TAG = "RewindWatch"
+
         // Configuration IDs for UserStyle settings
         const val SETTING_TIME_ID = "setting_time"
         const val SETTING_SECONDS_ID = "setting_seconds"
@@ -221,7 +223,11 @@ class MyWatchFace : WatchFaceService() {
         currentUserStyleRepository,
         watchState,
         CanvasType.HARDWARE,
-        16L,
+        // 1000ms baseline tick (covers seconds hand & minute updates).
+        // The accelerometer listener will invalidate() out-of-band when the
+        // wrist actually tilts, so parallax stays responsive without burning
+        // 60fps when the watch is still.
+        1000L,
         clearWithBackgroundTintBeforeRenderingHighlightLayer = true
     ), SensorEventListener {
 
@@ -239,6 +245,9 @@ class MyWatchFace : WatchFaceService() {
         private var baseY = 0f
         private var needsReset = true
         private var isSensorRegistered = false
+        private var lastInvalidatedGyroX = 0f
+        private var lastInvalidatedGyroY = 0f
+        private var lastSensorInvalidateAt = 0L
 
         // --- Battery State ---
         private var batteryLevel = 100
@@ -246,7 +255,9 @@ class MyWatchFace : WatchFaceService() {
             override fun onReceive(context: Context, intent: Intent) {
                 val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
                 val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-                batteryLevel = (level * 100 / scale.toFloat()).toInt()
+                if (level >= 0 && scale > 0) {
+                    batteryLevel = (level * 100 / scale.toFloat()).toInt()
+                }
             }
         }
 
@@ -259,7 +270,14 @@ class MyWatchFace : WatchFaceService() {
         private val rainFrames = Collections.synchronizedList(ArrayList<Bitmap>())
         private val snowFrames = Collections.synchronizedList(ArrayList<Bitmap>())
 
-        // Static Assets
+        // Static Assets — *Src holds the unscaled original so resize never compounds
+        @Volatile private var logoBitmapSrc: Bitmap? = null
+        @Volatile private var hourHandBitmapSrc: Bitmap? = null
+        @Volatile private var minuteHandBitmapSrc: Bitmap? = null
+        @Volatile private var centerUnderBitmapSrc: Bitmap? = null
+        @Volatile private var centerOverBitmapSrc: Bitmap? = null
+        @Volatile private var frameCenterSrc: Bitmap? = null
+
         @Volatile private var logoBitmap: Bitmap? = null
         @Volatile private var hourHandBitmap: Bitmap? = null
         @Volatile private var minuteHandBitmap: Bitmap? = null
@@ -375,10 +393,17 @@ class MyWatchFace : WatchFaceService() {
 
         // Weather & Solar State
         private var currentWeather = WeatherType.CLEAR
-        private var solarSchedule = SolarSchedule(
-            sunrise = System.currentTimeMillis() / 1000 - 3600 * 4,
-            sunset = System.currentTimeMillis() / 1000 + 3600 * 8
-        )
+        // Reasonable fallback until the weather API responds. Anchored to
+        // *today's* 06:00/18:00 instead of "now ± offset", so a watch face
+        // started at 2 AM doesn't believe sunset is at 9 AM.
+        private var solarSchedule: SolarSchedule = run {
+            val zone = java.time.ZoneId.systemDefault()
+            val today = java.time.LocalDate.now(zone)
+            SolarSchedule(
+                sunrise = today.atTime(6, 0).atZone(zone).toEpochSecond(),
+                sunset = today.atTime(18, 0).atZone(zone).toEpochSecond()
+            )
+        }
 
         // Utils
         private val scope = CoroutineScope(Dispatchers.Main)
@@ -389,26 +414,23 @@ class MyWatchFace : WatchFaceService() {
 
         override suspend fun createSharedAssets(): MySharedAssets = MySharedAssets()
 
-        private val prefsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
-            when (key) {
-                "time" -> showTime = prefs.getBoolean(SETTING_TIME_ID, true)
-                "seconds" -> showSeconds = prefs.getBoolean(SETTING_SECONDS_ID, true)
-                "date" -> showDate = prefs.getBoolean(SETTING_DATE_ID, true)
-                "battery" -> showBattery = prefs.getBoolean(SETTING_BATTERY_ID, true)
-                "weather_anim" -> showWeatherAnimation = prefs.getBoolean(SETTING_WEATHER_ANIM_ID, true)
-            }
-            invalidate()
-        }
-
         init {
             // Start async initialization
             scope.launch(Dispatchers.IO) {
                 try {
                     loadStaticResources()
+                    // Force the next render to rerun updateLayoutAndScale even
+                    // if bounds haven't changed, so the freshly loaded *Src
+                    // bitmaps get scaled into the displayed bitmap fields.
+                    withContext(Dispatchers.Main.immediate) {
+                        currentWidth = 0
+                        currentHeight = 0
+                        invalidate()
+                    }
                     fetchRealWeather()
                     withContext(Dispatchers.Main.immediate) { invalidate() }
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    Log.e(TAG, "Init load failed", e)
                 }
             }
 
@@ -424,15 +446,6 @@ class MyWatchFace : WatchFaceService() {
                 }
             }
 
-            // Initialize Preferences
-            val prefs = context.getSharedPreferences("MyWatchPrefs", Context.MODE_PRIVATE)
-            showTime = prefs.getBoolean(SETTING_TIME_ID, true)
-            showSeconds = prefs.getBoolean(SETTING_SECONDS_ID, true)
-            showDate = prefs.getBoolean(SETTING_DATE_ID, true)
-            showBattery = prefs.getBoolean(SETTING_BATTERY_ID, true)
-            showWeatherAnimation = prefs.getBoolean(SETTING_WEATHER_ANIM_ID, true)
-
-            prefs.registerOnSharedPreferenceChangeListener(prefsListener)
             startWeatherUpdater()
         }
 
@@ -490,6 +503,11 @@ class MyWatchFace : WatchFaceService() {
          * Falls back to active location request if cache is empty.
          */
         private fun fetchRealWeather() {
+            if (API_KEY.isBlank() || API_KEY == "null") {
+                Log.e(TAG, "OPEN_WEATHER_API_KEY is not set in local.properties — skipping weather fetch")
+                return
+            }
+
             if (ActivityCompat.checkSelfPermission(
                     context,
                     Manifest.permission.ACCESS_FINE_LOCATION
@@ -500,6 +518,7 @@ class MyWatchFace : WatchFaceService() {
                     Manifest.permission.ACCESS_COARSE_LOCATION
                 ) != PackageManager.PERMISSION_GRANTED
             ) {
+                Log.w(TAG, "Location permission not granted — falling back to Seoul")
                 fetchWeatherByCity("Seoul")
                 return
             }
@@ -507,48 +526,63 @@ class MyWatchFace : WatchFaceService() {
             // 1. Check last known location (Battery Saver)
             fusedLocationClient.lastLocation.addOnSuccessListener { location ->
                 if (location != null) {
+                    Log.d(TAG, "Using last known location ${location.latitude},${location.longitude}")
                     fetchWeatherByCoord(location.latitude, location.longitude)
                 } else {
                     // 2. Request active location if cache is empty
                     fusedLocationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null)
                         .addOnSuccessListener { currentLocation ->
                             if (currentLocation != null) {
+                                Log.d(TAG, "Got current location ${currentLocation.latitude},${currentLocation.longitude}")
                                 fetchWeatherByCoord(currentLocation.latitude, currentLocation.longitude)
                             } else {
+                                Log.w(TAG, "getCurrentLocation returned null — falling back to Seoul")
                                 fetchWeatherByCity("Seoul")
                             }
                         }
-                        .addOnFailureListener { fetchWeatherByCity("Seoul") }
+                        .addOnFailureListener {
+                            Log.w(TAG, "getCurrentLocation failed — falling back to Seoul", it)
+                            fetchWeatherByCity("Seoul")
+                        }
                 }
-            }.addOnFailureListener { fetchWeatherByCity("Seoul") }
+            }.addOnFailureListener {
+                Log.w(TAG, "lastLocation failed — falling back to Seoul", it)
+                fetchWeatherByCity("Seoul")
+            }
         }
 
         private fun fetchWeatherByCoord(lat: Double, lon: Double) {
             scope.launch(Dispatchers.IO) {
-                try {
-                    val urlString = "https://api.openweathermap.org/data/2.5/weather?lat=$lat&lon=$lon&appid=$API_KEY"
+                val urlString = "https://api.openweathermap.org/data/2.5/weather?lat=$lat&lon=$lon&appid=$API_KEY"
+                if (!parseAndApplyWeather(urlString)) {
+                    kotlinx.coroutines.delay(60_000L)
+                    Log.w(TAG, "Retrying weather fetch after 60s")
                     parseAndApplyWeather(urlString)
-                } catch (e: Exception) { e.printStackTrace() }
+                }
             }
         }
 
         private fun fetchWeatherByCity(city: String) {
             scope.launch(Dispatchers.IO) {
-                try {
-                    val urlString = "https://api.openweathermap.org/data/2.5/weather?q=$city&appid=$API_KEY"
+                val urlString = "https://api.openweathermap.org/data/2.5/weather?q=$city&appid=$API_KEY"
+                if (!parseAndApplyWeather(urlString)) {
+                    kotlinx.coroutines.delay(60_000L)
+                    Log.w(TAG, "Retrying weather fetch after 60s")
                     parseAndApplyWeather(urlString)
-                } catch (e: Exception) { e.printStackTrace() }
+                }
             }
         }
 
         /**
          * Parses JSON from OpenWeatherMap API.
          * Configured with timeouts to handle Wear OS Bluetooth proxy delays.
+         * Returns true on success, false on failure (caller may retry).
          */
-        private suspend fun parseAndApplyWeather(urlString: String) {
+        private suspend fun parseAndApplyWeather(urlString: String): Boolean {
+            var connection: HttpURLConnection? = null
             try {
                 val url = URL(urlString)
-                val connection = withContext(Dispatchers.IO) {
+                connection = withContext(Dispatchers.IO) {
                     url.openConnection() as HttpURLConnection
                 }
 
@@ -558,31 +592,42 @@ class MyWatchFace : WatchFaceService() {
                 connection.requestMethod = "GET"
                 connection.connect()
 
-                if (connection.responseCode == 200) {
-                    val stream = connection.inputStream
-                    val jsonText = stream.bufferedReader().use { it.readText() }
-
-                    val json = JSONObject(jsonText)
-                    val weatherArray = json.getJSONArray("weather")
-                    val mainWeather = weatherArray.getJSONObject(0).getString("main")
-                    val sys = json.getJSONObject("sys")
-                    val sunrise = sys.getLong("sunrise")
-                    val sunset = sys.getLong("sunset")
-
-                    solarSchedule = SolarSchedule(sunrise, sunset)
-
-                    val newWeather = when (mainWeather) {
-                        "Rain", "Drizzle", "Thunderstorm" -> WeatherType.RAIN
-                        "Snow" -> WeatherType.SNOW
-                        else -> WeatherType.CLEAR
+                val code = connection.responseCode
+                if (code != 200) {
+                    val sanitized = urlString.replace(API_KEY, "<redacted>")
+                    when (code) {
+                        401 -> Log.e(TAG, "Weather API returned 401 (bad API key) for $sanitized")
+                        429 -> Log.e(TAG, "Weather API returned 429 (rate limit) for $sanitized")
+                        else -> Log.w(TAG, "Weather API returned $code for $sanitized")
                     }
-
-                    updateWeatherResources(newWeather)
-                    withContext(Dispatchers.Main) { invalidate() }
+                    return false
                 }
-                connection.disconnect()
+
+                val jsonText = connection.inputStream.bufferedReader().use { it.readText() }
+                val json = JSONObject(jsonText)
+                val weatherArray = json.getJSONArray("weather")
+                val mainWeather = weatherArray.getJSONObject(0).getString("main")
+                val sys = json.getJSONObject("sys")
+                val sunrise = sys.getLong("sunrise")
+                val sunset = sys.getLong("sunset")
+
+                solarSchedule = SolarSchedule(sunrise, sunset)
+
+                val newWeather = when (mainWeather) {
+                    "Rain", "Drizzle", "Thunderstorm" -> WeatherType.RAIN
+                    "Snow" -> WeatherType.SNOW
+                    else -> WeatherType.CLEAR
+                }
+                Log.d(TAG, "Weather OK: $mainWeather → $newWeather (sunrise=$sunrise, sunset=$sunset)")
+
+                updateWeatherResources(newWeather)
+                withContext(Dispatchers.Main) { invalidate() }
+                return true
             } catch (e: Exception) {
-                // Log exception implicitly via debugger if needed, removed println
+                Log.w(TAG, "Weather fetch failed: ${e.javaClass.simpleName}: ${e.message}")
+                return false
+            } finally {
+                connection?.disconnect()
             }
         }
 
@@ -595,7 +640,6 @@ class MyWatchFace : WatchFaceService() {
 
             synchronized(rainFrames) { rainFrames.forEach { it.recycle() }; rainFrames.clear() }
             synchronized(snowFrames) { snowFrames.forEach { it.recycle() }; snowFrames.clear() }
-            System.gc()
 
             // 1. Load into temporary list with downsampling (1/2 size)
             val tempFrames = ArrayList<Bitmap>()
@@ -626,7 +670,6 @@ class MyWatchFace : WatchFaceService() {
                 // CLEAR weather: Release all memory
                 synchronized(rainFrames) { rainFrames.forEach { it.recycle() }; rainFrames.clear() }
                 synchronized(snowFrames) { snowFrames.forEach { it.recycle() }; snowFrames.clear() }
-                System.gc() // Request garbage collection
             }
 
             currentWeather = newType
@@ -643,54 +686,30 @@ class MyWatchFace : WatchFaceService() {
         }
 
         /**
-         * Loads static assets like hands and logos.
-         * Uses inSampleSize = 2 to optimize memory usage for large assets.
+         * Loads static assets at full resolution. Each 500x500 asset is ~1 MB,
+         * total ~6 MB — well below OOM. Originals are kept in *Src fields so
+         * updateLayoutAndScale always resamples from the original instead of
+         * compounding scale operations.
          */
         private fun loadStaticResources() {
-            val optionsAlpha = BitmapFactory.Options().apply { inSampleSize = 2 }
-            logoBitmap = try {
-                BitmapFactory.decodeResource(res, R.drawable.logo_rewind, optionsAlpha)
+            fun decode(resId: Int): Bitmap? = try {
+                BitmapFactory.decodeResource(res, resId, null)
             } catch (e: Exception) {
+                Log.w(TAG, "decodeResource failed for $resId", e)
                 null
-            }
-            hourHandBitmap = try {
-                BitmapFactory.decodeResource(res, R.drawable.hand_hour, optionsAlpha)
-            } catch (e: Exception) {
-                null
-            }
-            minuteHandBitmap = try {
-                BitmapFactory.decodeResource(res, R.drawable.hand_min, optionsAlpha)
-            } catch (e: Exception) {
-                null
-            }
-            centerUnderBitmap = try {
-                BitmapFactory.decodeResource(res, R.drawable.center_under, optionsAlpha)
-            } catch (e: Exception) {
-                null
-            }
-            centerOverBitmap = try {
-                BitmapFactory.decodeResource(res, R.drawable.center_over, optionsAlpha)
-            } catch (e: Exception) {
-                null
-            }
-            fun loadFrameBitmap(targetName: String, fallbackName: String): Bitmap? {
-                val resId =
-                    res.getIdentifier(targetName, "drawable", packageName).takeIf { it != 0 }
-
-                        ?: res.getIdentifier(fallbackName, "drawable", packageName)
-                return if (resId != 0) {
-                    try {
-                        BitmapFactory.decodeResource(res, resId, optionsAlpha)
-                    } catch (e: Exception) {
-                        null
-                    }
-                } else {
-                    null
-                }
             }
 
-            frameCenter = loadFrameBitmap("frame_center", "frame_left")
-                    }
+            logoBitmapSrc = decode(R.drawable.logo_rewind)
+            hourHandBitmapSrc = decode(R.drawable.hand_hour)
+            minuteHandBitmapSrc = decode(R.drawable.hand_min)
+            centerUnderBitmapSrc = decode(R.drawable.center_under)
+            centerOverBitmapSrc = decode(R.drawable.center_over)
+
+            val frameCenterId = res.getIdentifier("frame_center", "drawable", packageName)
+                .takeIf { it != 0 }
+                ?: res.getIdentifier("frame_left", "drawable", packageName)
+            frameCenterSrc = if (frameCenterId != 0) decode(frameCenterId) else null
+        }
 
         /**
          * Updates the background image based on the time of day.
@@ -698,12 +717,24 @@ class MyWatchFace : WatchFaceService() {
          */
         private fun updateBackgroundForTime() {
             val now = Instant.now().epochSecond
-            val buffer = 1800L
+
+            // Asymmetric windows that match how people actually perceive these
+            // transitions: dawn is brief and centered near sunrise; sunset
+            // includes the golden-hour buildup plus the post-sunset afterglow.
+            val dawnBefore = 30 * 60L   // 30 min before sunrise → DAWN begins
+            val dawnAfter = 15 * 60L    // 15 min after sunrise → DAWN ends
+            val sunsetBefore = 45 * 60L // 45 min before sunset → SUNSET begins
+            val sunsetAfter = 20 * 60L  // 20 min after sunset → NIGHT begins
+
+            val dawnStart = solarSchedule.sunrise - dawnBefore
+            val dawnEnd = solarSchedule.sunrise + dawnAfter
+            val sunsetStart = solarSchedule.sunset - sunsetBefore
+            val sunsetEnd = solarSchedule.sunset + sunsetAfter
 
             val newState = when {
-                now in (solarSchedule.sunrise - buffer)..(solarSchedule.sunrise + buffer) -> SkyState.DAWN
-                now in (solarSchedule.sunrise + buffer + 1)..(solarSchedule.sunset - buffer) -> SkyState.DAY
-                now in (solarSchedule.sunset - buffer)..(solarSchedule.sunset + buffer) -> SkyState.SUNSET
+                now in dawnStart..dawnEnd -> SkyState.DAWN
+                now in (dawnEnd + 1)..(sunsetStart - 1) -> SkyState.DAY
+                now in sunsetStart..sunsetEnd -> SkyState.SUNSET
                 else -> SkyState.NIGHT
             }
 
@@ -748,15 +779,29 @@ class MyWatchFace : WatchFaceService() {
             }
         }
 
+        /**
+         * Center-crops src into a targetSize × targetSize square sized at 1.4×
+         * the longer screen edge. Result is always square so drawInteractive's
+         * centered placement and parallax offset behave deterministically.
+         */
         private fun getScaledBackground(src: Bitmap, width: Int, height: Int): Bitmap {
             val scaleFactor = 1.4f
             val targetSize = (Math.max(width, height) * scaleFactor).toInt()
             if (src.width == targetSize && src.height == targetSize) return src
 
-            val scale = Math.max(targetSize.toFloat() / src.width, targetSize.toFloat() / src.height)
-            val newW = (src.width * scale).toInt()
-            val newH = (src.height * scale).toInt()
-            return Bitmap.createScaledBitmap(src, newW, newH, true)
+            val scale = Math.max(
+                targetSize.toFloat() / src.width,
+                targetSize.toFloat() / src.height
+            )
+            val newW = (src.width * scale).toInt().coerceAtLeast(targetSize)
+            val newH = (src.height * scale).toInt().coerceAtLeast(targetSize)
+            val scaled = Bitmap.createScaledBitmap(src, newW, newH, true)
+
+            val cropX = (newW - targetSize) / 2
+            val cropY = (newH - targetSize) / 2
+            val cropped = Bitmap.createBitmap(scaled, cropX, cropY, targetSize, targetSize)
+            if (scaled !== cropped && scaled !== src) scaled.recycle()
+            return cropped
         }
 
         private fun loadAnimationFrames(
@@ -808,16 +853,40 @@ class MyWatchFace : WatchFaceService() {
                 }
             }
 
-            logoBitmap?.let {
+            // Always rescale from the *Src original — never from a previously
+            // scaled result — so repeated bounds changes don't compound losses.
+            logoBitmapSrc?.let { src ->
                 val targetWidth = (width * LOGO_SCALE_FACTOR).toInt()
-                val targetHeight = (it.height * (targetWidth.toFloat() / it.width)).toInt()
-                logoBitmap = ensureScaled(it, targetWidth, targetHeight)
+                val targetHeight = (src.height * (targetWidth.toFloat() / src.width)).toInt()
+                val old = logoBitmap
+                logoBitmap = ensureScaled(src, targetWidth, targetHeight)
+                if (old != null && old !== logoBitmap && old !== src) old.recycle()
             }
-            hourHandBitmap?.let { hourHandBitmap = ensureScaled(it, width, height) }
-            minuteHandBitmap?.let { minuteHandBitmap = ensureScaled(it, width, height) }
-            centerUnderBitmap?.let { centerUnderBitmap = ensureScaled(it, width, height)}
-            centerOverBitmap?.let { centerOverBitmap = ensureScaled(it, width, height)}
-            frameCenter?.let { frameCenter = ensureScaled(it, width, height) }
+            hourHandBitmapSrc?.let { src ->
+                val old = hourHandBitmap
+                hourHandBitmap = ensureScaled(src, width, height)
+                if (old != null && old !== hourHandBitmap && old !== src) old.recycle()
+            }
+            minuteHandBitmapSrc?.let { src ->
+                val old = minuteHandBitmap
+                minuteHandBitmap = ensureScaled(src, width, height)
+                if (old != null && old !== minuteHandBitmap && old !== src) old.recycle()
+            }
+            centerUnderBitmapSrc?.let { src ->
+                val old = centerUnderBitmap
+                centerUnderBitmap = ensureScaled(src, width, height)
+                if (old != null && old !== centerUnderBitmap && old !== src) old.recycle()
+            }
+            centerOverBitmapSrc?.let { src ->
+                val old = centerOverBitmap
+                centerOverBitmap = ensureScaled(src, width, height)
+                if (old != null && old !== centerOverBitmap && old !== src) old.recycle()
+            }
+            frameCenterSrc?.let { src ->
+                val old = frameCenter
+                frameCenter = ensureScaled(src, width, height)
+                if (old != null && old !== frameCenter && old !== src) old.recycle()
+            }
 
             // Vignette Shader
             val radius = Math.max(width, height) / 2f
@@ -857,8 +926,9 @@ class MyWatchFace : WatchFaceService() {
                 } else {
                     drawInteractive(canvas, now)
                 }
-            } catch (e: Exception) { e.printStackTrace() }
-            finally { if (renderParameters.drawMode == DrawMode.INTERACTIVE) invalidate() }
+            } catch (e: Exception) {
+                Log.w(TAG, "render failed", e)
+            }
         }
 
         private fun drawInteractive(canvas: Canvas, zonedDateTime: ZonedDateTime) {
@@ -1128,6 +1198,15 @@ class MyWatchFace : WatchFaceService() {
         }
 
         private fun drawAmbient(canvas: Canvas, zonedDateTime: ZonedDateTime) {
+            // OLED burn-in defense: nudge the whole frame by 0-1 px on a 4-min
+            // cycle so the same pixels don't stay lit hours at a time.
+            // (0,0) → (1,0) → (1,1) → (0,1) → repeat
+            val cycle = zonedDateTime.minute % 4
+            val shiftX = if (cycle == 1 || cycle == 2) 1f else 0f
+            val shiftY = if (cycle == 2 || cycle == 3) 1f else 0f
+            canvas.save()
+            canvas.translate(shiftX, shiftY)
+
             frameCenter?.let { drawBitmapAt(canvas, it, 0f, 0f, grayScalePaint) }
             val hours = zonedDateTime.hour + zonedDateTime.minute / 60f
             val minutes = zonedDateTime.minute.toFloat()
@@ -1146,6 +1225,8 @@ class MyWatchFace : WatchFaceService() {
             centerOverBitmap?.let { drawBitmapAt(canvas, it, 0f, 0f, grayScalePaint)}
 
             if (showDate) drawDateInfo(canvas, zonedDateTime, true)
+
+            canvas.restore()
         }
 
         private fun drawBitmapAt(
@@ -1181,16 +1262,27 @@ class MyWatchFace : WatchFaceService() {
         }
 
         override fun onSensorChanged(event: SensorEvent) {
-            if (event.sensor.type == Sensor.TYPE_ACCELEROMETER) {
-                val x = event.values[0]
-                val y = event.values[1]
-                if (needsReset) {
-                    baseX = x
-                    baseY = y
-                    needsReset = false
-                }
-                gyroX = gyroX * 0.9f + x * 0.1f
-                gyroY = gyroY * 0.9f + y * 0.1f
+            if (event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
+            val x = event.values[0]
+            val y = event.values[1]
+            if (needsReset) {
+                baseX = x
+                baseY = y
+                needsReset = false
+            }
+            gyroX = gyroX * 0.9f + x * 0.1f
+            gyroY = gyroY * 0.9f + y * 0.1f
+
+            // Only repaint when tilt meaningfully changed and at most ~30Hz.
+            // Eliminates the previous ~50Hz invalidate flood when the wrist
+            // was sitting still (sensor still fires but values barely move).
+            val dx = Math.abs(gyroX - lastInvalidatedGyroX)
+            val dy = Math.abs(gyroY - lastInvalidatedGyroY)
+            val now = System.currentTimeMillis()
+            if ((dx > 0.05f || dy > 0.05f) && now - lastSensorInvalidateAt > 33L) {
+                lastInvalidatedGyroX = gyroX
+                lastInvalidatedGyroY = gyroY
+                lastSensorInvalidateAt = now
                 invalidate()
             }
         }
@@ -1211,6 +1303,14 @@ class MyWatchFace : WatchFaceService() {
             frameCenter?.recycle()
             hourHandBitmap?.recycle()
             minuteHandBitmap?.recycle()
+            centerUnderBitmap?.recycle()
+            centerOverBitmap?.recycle()
+            logoBitmapSrc?.recycle()
+            frameCenterSrc?.recycle()
+            hourHandBitmapSrc?.recycle()
+            minuteHandBitmapSrc?.recycle()
+            centerUnderBitmapSrc?.recycle()
+            centerOverBitmapSrc?.recycle()
         }
     }
 }

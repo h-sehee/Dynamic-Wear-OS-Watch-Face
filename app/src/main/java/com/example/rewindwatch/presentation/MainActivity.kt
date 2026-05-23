@@ -1,10 +1,14 @@
 package com.example.rewindwatch.presentation
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.ActivityCompat
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -29,6 +33,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
@@ -43,6 +48,7 @@ import androidx.wear.watchface.editor.EditorSession
 import androidx.wear.watchface.style.UserStyle
 import androidx.wear.watchface.style.UserStyleSetting
 import com.example.rewindwatch.MyWatchFace
+import com.example.rewindwatch.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -51,18 +57,61 @@ import kotlin.math.sin
 
 /**
  * Main activity for the Watch Face customization UI.
+ *
+ * Entry points:
+ * - WATCH_FACE_EDITOR action — opened from the watch face picker for tweaks.
+ * - MAIN/LAUNCHER — opened from the app drawer; lets the user grant location
+ *   permission so the weather backend can stop falling back to "Seoul".
+ *
+ * Either path triggers the runtime permission prompt if location access is
+ * missing — the WatchFace service itself is a WallpaperService and can't show
+ * UI, so this activity is the only place we can ask.
  */
 class MainActivity : ComponentActivity() {
     private val editorSessionState = mutableStateOf<EditorSession?>(null)
     private val isReady = mutableStateOf(false)
+    private val hasLocationPermission = mutableStateOf(false)
+
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        hasLocationPermission.value = results.values.any { it } || checkLocationPermission()
+        Log.d(
+            "RewindWatch",
+            "Permission result: fine=${results[Manifest.permission.ACCESS_FINE_LOCATION]} " +
+                "coarse=${results[Manifest.permission.ACCESS_COARSE_LOCATION]}"
+        )
+    }
+
+    private fun checkLocationPermission(): Boolean {
+        val fine = ActivityCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        val coarse = ActivityCompat.checkSelfPermission(
+            this, Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+        return fine || coarse
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Make window transparent to see the watch face behind
         window.setBackgroundDrawableResource(android.R.color.transparent)
 
+        hasLocationPermission.value = checkLocationPermission()
+        if (!hasLocationPermission.value) {
+            permissionLauncher.launch(
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                )
+            )
+        }
+
         if (intent.action != "androidx.wear.watchface.editor.action.WATCH_FACE_EDITOR") {
-            setContent { MaterialTheme { Box(modifier = Modifier.fillMaxSize().background(Color.Black), contentAlignment = Alignment.Center) { Text("Customize Mode", color = Color.White) } } }
+            // Launched from the app drawer — show a status screen so the user
+            // knows whether the permission grant worked.
+            setContent { MaterialTheme { LauncherScreen(hasLocationPermission) } }
             return
         }
 
@@ -70,9 +119,50 @@ class MainActivity : ComponentActivity() {
             try {
                 editorSessionState.value = EditorSession.createOnWatchEditorSession(this@MainActivity)
                 isReady.value = true
-            } catch (e: Exception) { finish() }
+            } catch (e: Exception) {
+                Log.e("RewindWatch", "EditorSession.createOnWatchEditorSession failed", e)
+                finish()
+            }
         }
-        setContent { MaterialTheme { if (isReady.value && editorSessionState.value != null) EditWatchFaceScreen(editorSessionState.value!!) } }
+        setContent {
+            MaterialTheme {
+                if (isReady.value && editorSessionState.value != null) {
+                    EditWatchFaceScreen(editorSessionState.value!!)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LauncherScreen(grantedState: androidx.compose.runtime.State<Boolean>) {
+    val granted by grantedState
+    Box(
+        modifier = Modifier.fillMaxSize().background(Color.Black),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(horizontal = 18.dp),
+        ) {
+            Text(
+                text = "RewindWatch",
+                color = Color.White,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = if (granted) {
+                    stringResource(R.string.launcher_permission_granted)
+                } else {
+                    stringResource(R.string.launcher_permission_needed)
+                },
+                color = if (granted) Color(0xFF7CC576) else Color.LightGray,
+                fontSize = 11.sp,
+                textAlign = TextAlign.Center,
+            )
+        }
     }
 }
 
@@ -113,7 +203,7 @@ fun EditWatchFaceScreen(session: EditorSession) {
                     )
                     // Page 1: Date
                     1 -> VerticalSwitchWeightPage(
-                        title = "날짜",
+                        title = stringResource(R.string.config_date_title),
                         isChecked = showDate,
                         weightIndex = dateWeight.toIntOrNull() ?: 0,
                         currentPage = 1,
@@ -123,7 +213,7 @@ fun EditWatchFaceScreen(session: EditorSession) {
                     )
                     // Page 2: Battery
                     2 -> VerticalSwitchWeightPage(
-                        title = "배터리",
+                        title = stringResource(R.string.config_battery_title),
                         isChecked = showBattery,
                         weightIndex = batteryWeight.toIntOrNull() ?: 2,
                         currentPage = 2,
@@ -219,7 +309,7 @@ fun FontStyleVisualPage(
 
         // 3. Top Title (Small, like the photo)
         Text(
-            text = "글꼴",
+            text = stringResource(R.string.config_font_style_title),
             color = Color.White,
             style = MaterialTheme.typography.caption3,
             fontWeight = FontWeight.Medium,
@@ -299,7 +389,7 @@ fun TimeAndSecondsPage(
                 horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "시간",
+                    text = stringResource(R.string.config_time_title),
                     color = Color.White,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
@@ -319,7 +409,7 @@ fun TimeAndSecondsPage(
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
-                    text = "초",
+                    text = stringResource(R.string.config_seconds_title),
                     color = Color.White,
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
@@ -443,7 +533,7 @@ fun VerticalSwitchWeightPage(
 fun WeatherPage(isChecked: Boolean, onCheckChanged: (Boolean) -> Unit) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Box(modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.6f)))
-        ConfigToggleRow("날씨 효과", isChecked, onCheckChanged)
+        ConfigToggleRow(stringResource(R.string.config_weather_title), isChecked, onCheckChanged)
     }
 }
 
@@ -497,12 +587,87 @@ fun ConfigToggleRow(title: String, checked: Boolean, onDataChanged: (Boolean) ->
     }
 }
 
-// UserStyle Helper Functions (Keep as is)
-fun getBoolStyle(
-    style: UserStyle,settingId: String): Boolean { for ((setting, option) in style) { if (setting.id.value.toString() == settingId && option is UserStyleSetting.BooleanUserStyleSetting.BooleanOption) return option.value }; return true }
-fun getListStyleId(style: UserStyle, settingId: String): String { for ((setting, option) in style) { if (setting.id.value.toString() == settingId) return option.id.toString() }; return "0" }
-fun saveBoolStyle(context: Context, session: EditorSession, settingId: String, isEnabled: Boolean, scope: CoroutineScope) { scope.launch(Dispatchers.Main.immediate) { val mutableStyle = session.userStyle.value.toMutableUserStyle(); var targetSetting: UserStyleSetting.BooleanUserStyleSetting? = null; for ((setting, _) in mutableStyle) { if (setting.id.value.toString() == settingId && setting is UserStyleSetting.BooleanUserStyleSetting) { targetSetting = setting; break } }; if (targetSetting != null) { val newOption = targetSetting.options.find { (it as? UserStyleSetting.BooleanUserStyleSetting.BooleanOption)?.value == isEnabled }; if (newOption != null) { mutableStyle[targetSetting] = newOption; session.userStyle.value = mutableStyle.toUserStyle() } }; context.getSharedPreferences("MyWatchPrefs", Context.MODE_PRIVATE).edit().putBoolean(settingId, isEnabled).apply() } }
-fun saveListStyle(context: Context, session: EditorSession, settingId: String, optionId: String, scope: CoroutineScope) { scope.launch(Dispatchers.Main.immediate) { val mutableStyle = session.userStyle.value.toMutableUserStyle(); var targetSetting: UserStyleSetting.ListUserStyleSetting? = null; for ((setting, _) in mutableStyle) { if (setting.id.value.toString() == settingId && setting is UserStyleSetting.ListUserStyleSetting) { targetSetting = setting; break } }; if (targetSetting != null) { val newOption = targetSetting.options.find { it.id.toString() == optionId }; if (newOption != null) { mutableStyle[targetSetting] = newOption; session.userStyle.value = mutableStyle.toUserStyle() } } } }
+// UserStyle helpers — formatted for readability.
+// Source of truth is the EditorSession's UserStyle flow; the watch face
+// subscribes to it directly (currentUserStyleRepository.userStyle).
+
+fun getBoolStyle(style: UserStyle, settingId: String): Boolean {
+    for ((setting, option) in style) {
+        if (setting.id.value.toString() == settingId &&
+            option is UserStyleSetting.BooleanUserStyleSetting.BooleanOption
+        ) {
+            return option.value
+        }
+    }
+    return true
+}
+
+fun getListStyleId(style: UserStyle, settingId: String): String {
+    for ((setting, option) in style) {
+        if (setting.id.value.toString() == settingId) {
+            return option.id.toString()
+        }
+    }
+    return "0"
+}
+
+fun saveBoolStyle(
+    context: Context,
+    session: EditorSession,
+    settingId: String,
+    isEnabled: Boolean,
+    scope: CoroutineScope,
+) {
+    scope.launch(Dispatchers.Main.immediate) {
+        val mutableStyle = session.userStyle.value.toMutableUserStyle()
+        var targetSetting: UserStyleSetting.BooleanUserStyleSetting? = null
+        for ((setting, _) in mutableStyle) {
+            if (setting.id.value.toString() == settingId &&
+                setting is UserStyleSetting.BooleanUserStyleSetting
+            ) {
+                targetSetting = setting
+                break
+            }
+        }
+        if (targetSetting != null) {
+            val newOption = targetSetting.options.find {
+                (it as? UserStyleSetting.BooleanUserStyleSetting.BooleanOption)?.value == isEnabled
+            }
+            if (newOption != null) {
+                mutableStyle[targetSetting] = newOption
+                session.userStyle.value = mutableStyle.toUserStyle()
+            }
+        }
+    }
+}
+
+fun saveListStyle(
+    context: Context,
+    session: EditorSession,
+    settingId: String,
+    optionId: String,
+    scope: CoroutineScope,
+) {
+    scope.launch(Dispatchers.Main.immediate) {
+        val mutableStyle = session.userStyle.value.toMutableUserStyle()
+        var targetSetting: UserStyleSetting.ListUserStyleSetting? = null
+        for ((setting, _) in mutableStyle) {
+            if (setting.id.value.toString() == settingId &&
+                setting is UserStyleSetting.ListUserStyleSetting
+            ) {
+                targetSetting = setting
+                break
+            }
+        }
+        if (targetSetting != null) {
+            val newOption = targetSetting.options.find { it.id.toString() == optionId }
+            if (newOption != null) {
+                mutableStyle[targetSetting] = newOption
+                session.userStyle.value = mutableStyle.toUserStyle()
+            }
+        }
+    }
+}
 
 @Composable
 fun SystemTopPageIndicator(pagerState: androidx.wear.compose.foundation.pager.PagerState, modifier: Modifier = Modifier) {

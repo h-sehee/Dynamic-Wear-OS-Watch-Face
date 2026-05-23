@@ -13,3 +13,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+rewind-watch-key.jks
+/app/release/
+/app/build/
