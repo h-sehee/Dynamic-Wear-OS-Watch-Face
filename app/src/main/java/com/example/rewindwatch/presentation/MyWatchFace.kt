@@ -77,6 +77,9 @@ class MyWatchFace : WatchFaceService() {
         // OpenWeatherMap API Key
         private const val API_KEY = BuildConfig.OPEN_WEATHER_API_KEY
 
+        /** Sent by MainActivity after a location permission grant. */
+        const val ACTION_REFRESH_WEATHER = "com.example.rewindwatch.action.REFRESH_WEATHER"
+
         // Animation Configuration
         private const val FRAME_DURATION_MS = 180L
         private const val LOGO_SCALE_FACTOR = 0.6f
@@ -159,24 +162,24 @@ class MyWatchFace : WatchFaceService() {
             null,
 
             listOf(
-                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("0"), resources, R.string.font_style_sans, null), // Sans (Basic)
-                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("1"), resources, R.string.font_style_serif, null), // Serif
-                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("2"), resources, R.string.font_style_mono, null), // Mono
-                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("3"), resources, R.string.font_style_condensed, null), // Condensed
+                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("0"), resources, R.string.font_style_sans, R.string.font_style_sans, null), // Sans (Basic)
+                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("1"), resources, R.string.font_style_serif, R.string.font_style_serif, null), // Serif
+                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("2"), resources, R.string.font_style_mono, R.string.font_style_mono, null), // Mono
+                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("3"), resources, R.string.font_style_condensed, R.string.font_style_condensed, null), // Condensed
             ),
             listOf(WatchFaceLayer.BASE),
             UserStyleSetting.ListUserStyleSetting.ListOption(
-                UserStyleSetting.Option.Id("0"), resources, R.string.font_style_sans, null
+                UserStyleSetting.Option.Id("0"), resources, R.string.font_style_sans, R.string.font_style_sans, null
             )
         )
 
         // 7. Font Weight List Setting
         fun createWeightSetting(id: String, defaultId: String): UserStyleSetting.ListUserStyleSetting {
             val options = listOf(
-                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("0"), resources, R.string.font_weight_normal, null), // Normal
-                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("1"), resources, R.string.font_weight_medium, null), // Medium
-                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("2"), resources, R.string.font_weight_bold, null), // Bold
-                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("3"), resources, R.string.font_weight_extrabold, null)  // ExtraBold
+                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("0"), resources, R.string.font_weight_normal, R.string.font_weight_normal, null), // Normal
+                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("1"), resources, R.string.font_weight_medium, R.string.font_weight_medium, null), // Medium
+                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("2"), resources, R.string.font_weight_bold, R.string.font_weight_bold, null), // Bold
+                UserStyleSetting.ListUserStyleSetting.ListOption(UserStyleSetting.Option.Id("3"), resources, R.string.font_weight_extrabold, R.string.font_weight_extrabold, null)  // ExtraBold
             )
             val defaultOption = options.find { it.id.toString() == defaultId } ?: options[0]
             return UserStyleSetting.ListUserStyleSetting(
@@ -269,6 +272,15 @@ class MyWatchFace : WatchFaceService() {
         // would stay on until the instance dies. sensorservice showed exactly
         // that: a second listener held for ~17h overnight on v2.0.
         private val isHeadless = watchState.isHeadless
+
+        // --- Weather refresh trigger (see ACTION_REFRESH_WEATHER) ---
+        private var isRefreshReceiverRegistered = false
+        private val refreshWeatherReceiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                Log.d(TAG, "Weather refresh requested")
+                scope.launch(Dispatchers.IO) { fetchRealWeather() }
+            }
+        }
 
         // --- Battery State ---
         private var batteryLevel = 100
@@ -451,7 +463,10 @@ class MyWatchFace : WatchFaceService() {
                         currentHeight = 0
                         invalidate()
                     }
-                    fetchRealWeather()
+                    // Headless instances (editor preview, picker thumbnails) only
+                    // ever draw a snapshot: skip the network fetch, the 30-min
+                    // polling loop and the ~19 MB weather frame set entirely.
+                    if (!isHeadless) fetchRealWeather()
                     withContext(Dispatchers.Main.immediate) { invalidate() }
                 } catch (e: Exception) {
                     Log.e(TAG, "Init load failed", e)
@@ -484,7 +499,18 @@ class MyWatchFace : WatchFaceService() {
                 }
             }
 
-            startWeatherUpdater()
+            if (!isHeadless) {
+                startWeatherUpdater()
+                // MainActivity fires this right after the user grants location,
+                // so the face switches from the Seoul fallback immediately
+                // instead of at the next 30-min tick.
+                androidx.core.content.ContextCompat.registerReceiver(
+                    context, refreshWeatherReceiver,
+                    IntentFilter(ACTION_REFRESH_WEATHER),
+                    androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+                )
+                isRefreshReceiverRegistered = true
+            }
         }
 
         private fun updateWatchFaceStyle(userStyle: UserStyle) {
@@ -1359,6 +1385,9 @@ class MyWatchFace : WatchFaceService() {
             super.onDestroy()
             sensorManager.unregisterListener(this)
             try { context.unregisterReceiver(batteryReceiver) } catch (e: Exception) {}
+            if (isRefreshReceiverRegistered) {
+                try { context.unregisterReceiver(refreshWeatherReceiver) } catch (e: Exception) {}
+            }
             scope.cancel()
 
             // Resource Cleanup to prevent memory leaks

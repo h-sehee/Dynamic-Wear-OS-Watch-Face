@@ -76,6 +76,11 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { results ->
         hasLocationPermission.value = results.values.any { it } || checkLocationPermission()
+        if (hasLocationPermission.value) {
+            sendBroadcast(
+                android.content.Intent(MyWatchFace.ACTION_REFRESH_WEATHER).setPackage(packageName)
+            )
+        }
         Log.d(
             "RewindWatch",
             "Permission result: fine=${results[Manifest.permission.ACCESS_FINE_LOCATION]} " +
@@ -281,7 +286,7 @@ fun FontStyleVisualPage(
             val cutoutWidth = size.width * 0.4f
             val cutoutHeight = size.height * 0.32f
             val left = (size.width - cutoutWidth) / 2
-            val top = (size.height - cutoutHeight) / 2 + 9
+            val top = (size.height - cutoutHeight) / 2 + 9 * (size.height / 450f)
 
             // Punch the hole (Clear mode)
             drawRoundRect(
@@ -355,7 +360,7 @@ fun TimeAndSecondsPage(
             val cutoutWidth = size.width * 0.4f
             val cutoutHeight = size.height * 0.15f
             val left = (size.width - cutoutWidth) / 2
-            val top = (size.height - cutoutHeight) / 3 + 23
+            val top = (size.height - cutoutHeight) / 3 + 23 * (size.height / 450f)
 
             // Punch the hole (Clear mode)
             drawRoundRect(
@@ -467,15 +472,15 @@ fun VerticalSwitchWeightPage(
             val baseTop = (size.height - cutoutHeight) * 2 / 3
             val top = if (currentPage == 1) {
                 if (isOtherElementVisible) {
-                    baseTop - 35
+                    baseTop - 35 * (size.height / 450f)
                 } else {
-                    baseTop - 22
+                    baseTop - 22 * (size.height / 450f)
                 }
             } else {
                 if (isOtherElementVisible) {
-                    baseTop - 7
+                    baseTop - 7 * (size.height / 450f)
                 } else {
-                    baseTop - 18
+                    baseTop - 18 * (size.height / 450f)
                 }
             }
 
