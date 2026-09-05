@@ -19,3 +19,8 @@ local.properties
 rewind-watch-key.jks
 /app/release/
 /app/build/
+
+# local adb binaries dropped in the repo root for manual installs
+/adb.exe
+/AdbWinApi.dll
+/AdbWinUsbApi.dll
