@@ -61,7 +61,6 @@ android {
 
 dependencies {
 
-    implementation(libs.play.services.wearable)
     implementation(platform(libs.compose.bom))
     implementation(libs.ui)
     implementation(libs.ui.graphics)
@@ -81,7 +80,6 @@ dependencies {
     implementation("androidx.wear.watchface:watchface-editor:1.2.1")
     implementation("androidx.wear.compose:compose-foundation:1.5.6")
     implementation("androidx.wear.compose:compose-material:1.5.6")
-    implementation("androidx.wear.compose:compose-navigation:1.5.6")
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.ui.test.junit4)
     debugImplementation(libs.ui.tooling)

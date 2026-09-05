@@ -1,7 +1,6 @@
 package com.example.rewindwatch.presentation
 
 import android.Manifest
-import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.util.Log
@@ -31,7 +30,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -81,22 +79,15 @@ class MainActivity : ComponentActivity() {
                 android.content.Intent(MyWatchFace.ACTION_REFRESH_WEATHER).setPackage(packageName)
             )
         }
-        Log.d(
-            "RewindWatch",
-            "Permission result: fine=${results[Manifest.permission.ACCESS_FINE_LOCATION]} " +
-                "coarse=${results[Manifest.permission.ACCESS_COARSE_LOCATION]}"
-        )
+        Log.d("RewindWatch", "Permission result: coarse=${results[Manifest.permission.ACCESS_COARSE_LOCATION]}")
     }
 
-    private fun checkLocationPermission(): Boolean {
-        val fine = ActivityCompat.checkSelfPermission(
-            this, Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-        val coarse = ActivityCompat.checkSelfPermission(
+    // Coarse (city-level) is all the weather lookup needs; asking for fine
+    // location would be over-collection for a watch face.
+    private fun checkLocationPermission(): Boolean =
+        ActivityCompat.checkSelfPermission(
             this, Manifest.permission.ACCESS_COARSE_LOCATION
         ) == PackageManager.PERMISSION_GRANTED
-        return fine || coarse
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -105,12 +96,7 @@ class MainActivity : ComponentActivity() {
 
         hasLocationPermission.value = checkLocationPermission()
         if (!hasLocationPermission.value) {
-            permissionLauncher.launch(
-                arrayOf(
-                    Manifest.permission.ACCESS_FINE_LOCATION,
-                    Manifest.permission.ACCESS_COARSE_LOCATION,
-                )
-            )
+            permissionLauncher.launch(arrayOf(Manifest.permission.ACCESS_COARSE_LOCATION))
         }
 
         if (intent.action != "androidx.wear.watchface.editor.action.WATCH_FACE_EDITOR") {
@@ -174,7 +160,6 @@ private fun LauncherScreen(grantedState: androidx.compose.runtime.State<Boolean>
 @Composable
 fun EditWatchFaceScreen(session: EditorSession) {
     val userStyle by session.userStyle.collectAsState()
-    val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
     // Retrieve settings
@@ -202,9 +187,9 @@ fun EditWatchFaceScreen(session: EditorSession) {
                         timeChecked = showTime,
                         secondsChecked = showSeconds,
                         timeWeightIndex = timeWeight.toIntOrNull() ?: 2,
-                        onTimeCheckChanged = { saveBoolStyle(context, session, MyWatchFace.SETTING_TIME_ID, it, scope) },
-                        onSecondsCheckChanged = { saveBoolStyle(context, session, MyWatchFace.SETTING_SECONDS_ID, it, scope) },
-                        onTimeWeightChanged = { saveListStyle(context, session, MyWatchFace.SETTING_TIME_WEIGHT_ID, it.toString(), scope) }
+                        onTimeCheckChanged = { saveBoolStyle(session, MyWatchFace.SETTING_TIME_ID, it, scope) },
+                        onSecondsCheckChanged = { saveBoolStyle(session, MyWatchFace.SETTING_SECONDS_ID, it, scope) },
+                        onTimeWeightChanged = { saveListStyle(session, MyWatchFace.SETTING_TIME_WEIGHT_ID, it.toString(), scope) }
                     )
                     // Page 1: Date
                     1 -> VerticalSwitchWeightPage(
@@ -213,8 +198,8 @@ fun EditWatchFaceScreen(session: EditorSession) {
                         weightIndex = dateWeight.toIntOrNull() ?: 0,
                         currentPage = 1,
                         isOtherElementVisible = showBattery,
-                        onCheckChanged = { saveBoolStyle(context, session, MyWatchFace.SETTING_DATE_ID, it, scope) },
-                        onWeightChanged = { saveListStyle(context, session, MyWatchFace.SETTING_DATE_WEIGHT_ID, it.toString(), scope) }
+                        onCheckChanged = { saveBoolStyle(session, MyWatchFace.SETTING_DATE_ID, it, scope) },
+                        onWeightChanged = { saveListStyle(session, MyWatchFace.SETTING_DATE_WEIGHT_ID, it.toString(), scope) }
                     )
                     // Page 2: Battery
                     2 -> VerticalSwitchWeightPage(
@@ -223,20 +208,20 @@ fun EditWatchFaceScreen(session: EditorSession) {
                         weightIndex = batteryWeight.toIntOrNull() ?: 2,
                         currentPage = 2,
                         isOtherElementVisible = showDate,
-                        onCheckChanged = { saveBoolStyle(context, session, MyWatchFace.SETTING_BATTERY_ID, it, scope) },
-                        onWeightChanged = { saveListStyle(context, session, MyWatchFace.SETTING_BATTERY_WEIGHT_ID, it.toString(), scope) }
+                        onCheckChanged = { saveBoolStyle(session, MyWatchFace.SETTING_BATTERY_ID, it, scope) },
+                        onWeightChanged = { saveListStyle(session, MyWatchFace.SETTING_BATTERY_WEIGHT_ID, it.toString(), scope) }
                     )
 
                     // Page 3: Font Style
                     3 -> FontStyleVisualPage(
                         selectedIndex = fontStyle.toIntOrNull() ?: 0,
                         optionsCount = 4
-                    ) { idx -> saveListStyle(context, session, MyWatchFace.SETTING_FONT_STYLE_ID, idx.toString(), scope) }
+                    ) { idx -> saveListStyle(session, MyWatchFace.SETTING_FONT_STYLE_ID, idx.toString(), scope) }
 
                     // Page 4: Weather
                     4 -> WeatherPage(
                         isChecked = showWeather,
-                        onCheckChanged = { saveBoolStyle(context, session, MyWatchFace.SETTING_WEATHER_ANIM_ID, it, scope) }
+                        onCheckChanged = { saveBoolStyle(session, MyWatchFace.SETTING_WEATHER_ANIM_ID, it, scope) }
                     )
                 }
             }
@@ -617,7 +602,6 @@ fun getListStyleId(style: UserStyle, settingId: String): String {
 }
 
 fun saveBoolStyle(
-    context: Context,
     session: EditorSession,
     settingId: String,
     isEnabled: Boolean,
@@ -647,7 +631,6 @@ fun saveBoolStyle(
 }
 
 fun saveListStyle(
-    context: Context,
     session: EditorSession,
     settingId: String,
     optionId: String,

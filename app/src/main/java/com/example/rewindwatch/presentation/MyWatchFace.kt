@@ -57,6 +57,27 @@ enum class WeatherType { CLEAR, RAIN, SNOW }
  */
 data class SolarSchedule(val sunrise: Long, val sunset: Long)
 
+/**
+ * Solar phase for a moment in time. Windows are asymmetric to match how the
+ * transitions are perceived: dawn is brief and centred on sunrise; sunset
+ * includes the golden-hour build-up and a short afterglow.
+ */
+internal fun skyStateAt(nowEpochSec: Long, s: SolarSchedule): SkyState {
+    val dawnStart = s.sunrise - 30 * 60
+    val dawnEnd = s.sunrise + 15 * 60
+    val sunsetStart = s.sunset - 45 * 60
+    val sunsetEnd = s.sunset + 20 * 60
+    return when {
+        nowEpochSec in dawnStart..dawnEnd -> SkyState.DAWN
+        nowEpochSec in (dawnEnd + 1)..(sunsetStart - 1) -> SkyState.DAY
+        nowEpochSec in sunsetStart..sunsetEnd -> SkyState.SUNSET
+        else -> SkyState.NIGHT
+    }
+}
+
+/** ~11 km resolution: enough to debug weather lookups without logging a home address. */
+private fun coarse(v: Double): String = String.format(java.util.Locale.US, "%.1f", v)
+
 class MyWatchFace : WatchFaceService() {
 
     companion object {
@@ -79,6 +100,10 @@ class MyWatchFace : WatchFaceService() {
 
         /** Sent by MainActivity after a location permission grant. */
         const val ACTION_REFRESH_WEATHER = "com.example.rewindwatch.action.REFRESH_WEATHER"
+
+        // Weather refresh cadence; also the staleness threshold used when the
+        // face becomes visible again after the watch slept through the timer.
+        private const val WEATHER_REFRESH_MS = 30 * 60 * 1000L
 
         // Animation Configuration
         private const val FRAME_DURATION_MS = 180L
@@ -238,8 +263,6 @@ class MyWatchFace : WatchFaceService() {
         private val sensorManager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
         private val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         private lateinit var fusedLocationClient: FusedLocationProviderClient
-        private val bitmapLock = Any()
-        private var lastStyleUpdateTime = 0L
 
         // Static assets are preloaded on IO, but the very first render must
         // never race that load: the system snapshots a headless instance right
@@ -274,11 +297,12 @@ class MyWatchFace : WatchFaceService() {
         private val isHeadless = watchState.isHeadless
 
         // --- Weather refresh trigger (see ACTION_REFRESH_WEATHER) ---
+        @Volatile private var lastWeatherFetchAt = 0L
         private var isRefreshReceiverRegistered = false
         private val refreshWeatherReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 Log.d(TAG, "Weather refresh requested")
-                scope.launch(Dispatchers.IO) { fetchRealWeather() }
+                scope.launch(Dispatchers.IO) { fetchRealWeather(force = true) }
             }
         }
 
@@ -295,9 +319,15 @@ class MyWatchFace : WatchFaceService() {
         }
 
         // --- Graphic Resources ---
-        // Memory Optimization: Keep only the current background bitmap
-        @Volatile private var currentBackgroundBitmap: Bitmap? = null
+        // All four skies are decoded once (630px RGB_565, ~0.8 MB each) so a
+        // dawn/day/sunset/night transition is a reference swap on the UI thread,
+        // never a decode. skySrc holds the decoded originals; sky holds copies
+        // scaled to the current bounds (the same object on a 450px display).
+        private val skySrc = java.util.EnumMap<SkyState, Bitmap>(SkyState::class.java)
+        private val sky = java.util.EnumMap<SkyState, Bitmap>(SkyState::class.java)
+        private var currentBackgroundBitmap: Bitmap? = null
         private var currentSkyState: SkyState = SkyState.UNKNOWN
+        private val weatherDestRect = Rect()
 
         // Weather Animation Frames (Loaded on demand)
         private val rainFrames = Collections.synchronizedList(ArrayList<Bitmap>())
@@ -428,11 +458,11 @@ class MyWatchFace : WatchFaceService() {
         @Volatile private var currentHeight = 0
 
         // Weather & Solar State
-        private var currentWeather = WeatherType.CLEAR
+        @Volatile private var currentWeather = WeatherType.CLEAR
         // Reasonable fallback until the weather API responds. Anchored to
         // *today's* 06:00/18:00 instead of "now ± offset", so a watch face
         // started at 2 AM doesn't believe sunset is at 9 AM.
-        private var solarSchedule: SolarSchedule = run {
+        @Volatile private var solarSchedule: SolarSchedule = run {
             val zone = java.time.ZoneId.systemDefault()
             val today = java.time.LocalDate.now(zone)
             SolarSchedule(
@@ -490,6 +520,14 @@ class MyWatchFace : WatchFaceService() {
                 watchState.isVisible.collect { visible ->
                     isFaceVisible = visible ?: true
                     syncSensorState()
+                    // delay()-based polling stalls while the watch sleeps, so a
+                    // face that just came back on screen may hold hours-old
+                    // weather. fetchRealWeather() itself dedupes bursts.
+                    if (visible == true && !isHeadless &&
+                        System.currentTimeMillis() - lastWeatherFetchAt > WEATHER_REFRESH_MS
+                    ) {
+                        scope.launch(Dispatchers.IO) { fetchRealWeather() }
+                    }
                 }
             }
             scope.launch(Dispatchers.Main) {
@@ -541,7 +579,6 @@ class MyWatchFace : WatchFaceService() {
             dateWeightId = getListId(SETTING_DATE_WEIGHT_ID)
             batteryWeightId = getListId(SETTING_BATTERY_WEIGHT_ID)
 
-            lastStyleUpdateTime = System.currentTimeMillis()
             updateInteractiveTick()
             invalidate()
         }
@@ -585,20 +622,22 @@ class MyWatchFace : WatchFaceService() {
          * Fetches weather data. Optimizes battery by checking cached location first.
          * Falls back to active location request if cache is empty.
          */
-        private fun fetchRealWeather() {
+        /**
+         * @param force bypass the 10s dedupe window (used right after the user
+         *   grants location, where a fresh fetch is the whole point).
+         */
+        private fun fetchRealWeather(force: Boolean = false) {
+            val now = System.currentTimeMillis()
+            if (!force && now - lastWeatherFetchAt < 10_000L) return
+            lastWeatherFetchAt = now
+
             if (API_KEY.isBlank() || API_KEY == "null") {
                 Log.e(TAG, "OPEN_WEATHER_API_KEY is not set in local.properties — skipping weather fetch")
                 return
             }
 
             if (ActivityCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.ACCESS_FINE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED &&
-
-                ActivityCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.ACCESS_COARSE_LOCATION
+                    context, Manifest.permission.ACCESS_COARSE_LOCATION
                 ) != PackageManager.PERMISSION_GRANTED
             ) {
                 Log.w(TAG, "Location permission not granted — falling back to Seoul")
@@ -609,14 +648,14 @@ class MyWatchFace : WatchFaceService() {
             // 1. Check last known location (Battery Saver)
             fusedLocationClient.lastLocation.addOnSuccessListener { location ->
                 if (location != null) {
-                    Log.d(TAG, "Using last known location ${location.latitude},${location.longitude}")
+                    Log.d(TAG, "Using last known location ${coarse(location.latitude)},${coarse(location.longitude)}")
                     fetchWeatherByCoord(location.latitude, location.longitude)
                 } else {
                     // 2. Request active location if cache is empty
                     fusedLocationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null)
                         .addOnSuccessListener { currentLocation ->
                             if (currentLocation != null) {
-                                Log.d(TAG, "Got current location ${currentLocation.latitude},${currentLocation.longitude}")
+                                Log.d(TAG, "Got current location ${coarse(currentLocation.latitude)},${coarse(currentLocation.longitude)}")
                                 fetchWeatherByCoord(currentLocation.latitude, currentLocation.longitude)
                             } else {
                                 Log.w(TAG, "getCurrentLocation returned null — falling back to Seoul")
@@ -764,7 +803,7 @@ class MyWatchFace : WatchFaceService() {
         private fun startWeatherUpdater() {
             scope.launch(Dispatchers.IO) {
                 while (true) {
-                    kotlinx.coroutines.delay(30 * 60 * 1000L) // Update every 30 mins
+                    kotlinx.coroutines.delay(WEATHER_REFRESH_MS)
                     fetchRealWeather()
                     withContext(Dispatchers.Main) { invalidate() }
                 }
@@ -796,74 +835,33 @@ class MyWatchFace : WatchFaceService() {
                 .takeIf { it != 0 }
                 ?: res.getIdentifier("frame_left", "drawable", packageName)
             frameCenterSrc = if (frameCenterId != 0) decode(frameCenterId) else null
+
+            // Skies ship as 1260px centre-cropped squares; inSampleSize=2 lands
+            // exactly on the 630px (1.4x of 450) the parallax margin needs.
+            val skyOptions = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.RGB_565
+                inSampleSize = 2
+            }
+            fun decodeSky(state: SkyState, resId: Int) {
+                try {
+                    BitmapFactory.decodeResource(res, resId, skyOptions)?.let { skySrc[state] = it }
+                } catch (e: Exception) {
+                    Log.w(TAG, "sky decode failed for $state", e)
+                }
+            }
+            decodeSky(SkyState.DAWN, R.drawable.bg_sky_dawn)
+            decodeSky(SkyState.DAY, R.drawable.bg_sky_blue)
+            decodeSky(SkyState.SUNSET, R.drawable.bg_sky_sunset)
+            decodeSky(SkyState.NIGHT, R.drawable.bg_sky_night)
             staticAssetsLoaded = true
         }
 
-        /**
-         * Updates the background image based on the time of day.
-         * Runs on IO thread to prevent UI stutter.
-         */
+        /** Swaps the sky bitmap when the solar phase changes. UI thread, no I/O. */
         private fun updateBackgroundForTime() {
-            val now = Instant.now().epochSecond
-
-            // Asymmetric windows that match how people actually perceive these
-            // transitions: dawn is brief and centered near sunrise; sunset
-            // includes the golden-hour buildup plus the post-sunset afterglow.
-            val dawnBefore = 30 * 60L   // 30 min before sunrise → DAWN begins
-            val dawnAfter = 15 * 60L    // 15 min after sunrise → DAWN ends
-            val sunsetBefore = 45 * 60L // 45 min before sunset → SUNSET begins
-            val sunsetAfter = 20 * 60L  // 20 min after sunset → NIGHT begins
-
-            val dawnStart = solarSchedule.sunrise - dawnBefore
-            val dawnEnd = solarSchedule.sunrise + dawnAfter
-            val sunsetStart = solarSchedule.sunset - sunsetBefore
-            val sunsetEnd = solarSchedule.sunset + sunsetAfter
-
-            val newState = when {
-                now in dawnStart..dawnEnd -> SkyState.DAWN
-                now in (dawnEnd + 1)..(sunsetStart - 1) -> SkyState.DAY
-                now in sunsetStart..sunsetEnd -> SkyState.SUNSET
-                else -> SkyState.NIGHT
-            }
-
+            val newState = skyStateAt(Instant.now().epochSecond, solarSchedule)
             if (newState != currentSkyState) {
-                val resId = when (newState) {
-                    SkyState.DAWN -> R.drawable.bg_sky_dawn
-                    SkyState.DAY -> R.drawable.bg_sky_blue
-                    SkyState.SUNSET -> R.drawable.bg_sky_sunset
-                    SkyState.NIGHT -> R.drawable.bg_sky_night
-                    else -> R.drawable.bg_sky_night
-                }
-
-                // CRITICAL: Downsample background to 1/2 size
-                val options = BitmapFactory.Options().apply {
-                    inPreferredConfig = Bitmap.Config.RGB_565;
-                    inSampleSize = 2
-                }
-
-                var newBitmap: Bitmap? = try {
-                    BitmapFactory.decodeResource(res, resId, options)
-                } catch (e: Exception) { null }
-
-                // 스케일링 필요 시 처리
-                if (newBitmap != null && currentWidth > 0 && currentHeight > 0) {
-                    val scaled = getScaledBackground(newBitmap, currentWidth, currentHeight)
-                    if (scaled != newBitmap) {
-                        newBitmap.recycle()
-                        newBitmap = scaled
-                    }
-                }
-
-                synchronized(bitmapLock) {
-                    val oldBitmap = currentBackgroundBitmap
-
-                    currentSkyState = newState
-                    currentBackgroundBitmap = newBitmap
-
-                    if (oldBitmap != null && oldBitmap != newBitmap) {
-                        oldBitmap.recycle()
-                    }
-                }
+                currentSkyState = newState
+                currentBackgroundBitmap = sky[newState] ?: sky[SkyState.NIGHT]
             }
         }
 
@@ -934,16 +932,16 @@ class MyWatchFace : WatchFaceService() {
             screenCenterX = width / 2f
             screenCenterY = height / 2f
 
-            updateBackgroundForTime()
-
-            currentBackgroundBitmap?.let {
-                val targetSize = (Math.max(width, height) * 1.4f).toInt()
-                if (Math.abs(it.width - targetSize) > 50) {
-                    val old = it
-                    currentBackgroundBitmap = getScaledBackground(old, width, height)
-                    if (old != currentBackgroundBitmap) old.recycle()
-                }
+            // Skies: always rescale from the decoded original so a bounds change
+            // never resamples an already-resampled bitmap.
+            for ((state, src) in skySrc) {
+                val old = sky[state]
+                val scaled = getScaledBackground(src, width, height)
+                sky[state] = scaled
+                if (old != null && old !== scaled && old !== src) old.recycle()
             }
+            currentSkyState = SkyState.UNKNOWN   // force the swap below to pick the new bitmap
+            updateBackgroundForTime()
 
             // Always rescale from the *Src original — never from a previously
             // scaled result — so repeated bounds changes don't compound losses.
@@ -1007,7 +1005,6 @@ class MyWatchFace : WatchFaceService() {
             zonedDateTime: ZonedDateTime,
             sharedAssets: MySharedAssets
         ) {
-            val myId = System.identityHashCode(this)
             updateLayoutAndScale(bounds.width(), bounds.height())
             canvas.drawColor(Color.BLACK)
 
@@ -1033,24 +1030,18 @@ class MyWatchFace : WatchFaceService() {
             val diffY = (gyroY - baseY).coerceIn(-TILT_LIMIT, TILT_LIMIT)
 
             // 1. Draw Background (Parallax Effect)
-            synchronized(bitmapLock) {
-                val bg = currentBackgroundBitmap
-
-                if (bg != null && !bg.isRecycled) {
-                    val extraWidth = bg.width - currentWidth
-                    val extraHeight = bg.height - currentHeight
-                    val baseXPos = -extraWidth / 2f
-                    val baseYPos = -extraHeight / 2f
-                    val drawX = baseXPos + (diffX * DEPTH_SKY)
-                    val drawY = baseYPos + (diffY * DEPTH_SKY)
-
-                    canvas.drawBitmap(bg, drawX, drawY, null)
-                }
+            val bg = currentBackgroundBitmap
+            if (bg != null && !bg.isRecycled) {
+                val extraWidth = bg.width - currentWidth
+                val extraHeight = bg.height - currentHeight
+                val drawX = -extraWidth / 2f + (diffX * DEPTH_SKY)
+                val drawY = -extraHeight / 2f + (diffY * DEPTH_SKY)
+                canvas.drawBitmap(bg, drawX, drawY, null)
             }
 
             // 2. Draw Weather Animation
             // Optimization: Scale the small bitmap to fit screen size at draw time
-            val destRect = Rect(0, 0, currentWidth, currentHeight)
+            weatherDestRect.set(0, 0, currentWidth, currentHeight)
             if (showWeatherAnimation) {
                 val currentTime = System.currentTimeMillis()
 
@@ -1059,7 +1050,7 @@ class MyWatchFace : WatchFaceService() {
                         if (rainFrames.isNotEmpty()) {
                             val frameIndex = ((currentTime / FRAME_DURATION_MS) % rainFrames.size).toInt()
                             if (frameIndex < rainFrames.size) {
-                                canvas.drawBitmap(rainFrames[frameIndex], null, destRect, rainPaint)
+                                canvas.drawBitmap(rainFrames[frameIndex], null, weatherDestRect, rainPaint)
                             }
                         }
                     }
@@ -1068,7 +1059,7 @@ class MyWatchFace : WatchFaceService() {
                         if (snowFrames.isNotEmpty()) {
                             val frameIndex = ((currentTime / FRAME_DURATION_MS) % snowFrames.size).toInt()
                             if (frameIndex < snowFrames.size) {
-                                canvas.drawBitmap(snowFrames[frameIndex], null, destRect, snowPaint)
+                                canvas.drawBitmap(snowFrames[frameIndex], null, weatherDestRect, snowPaint)
                             }
                         }
                     }
@@ -1147,7 +1138,7 @@ class MyWatchFace : WatchFaceService() {
         private fun drawDigitalInfo(canvas: Canvas, zonedDateTime: ZonedDateTime) {
             digitalTextPaint.apply {
                 if (currentSkyState == SkyState.NIGHT) {
-                    setShadowLayer(18f, 0f, 0f, Color.parseColor("#FFFFFF"))
+                    setShadowLayer(18f, 0f, 0f, Color.WHITE)
                     alpha = 225
                 } else {
                     clearShadowLayer()
@@ -1189,7 +1180,7 @@ class MyWatchFace : WatchFaceService() {
                 } else {
                     color = Color.BLACK
                     if (currentSkyState == SkyState.NIGHT) {
-                        setShadowLayer(18f, 0f, 0f, Color.parseColor("#FFFFFF"))
+                        setShadowLayer(18f, 0f, 0f, Color.WHITE)
                         alpha = 225
                     } else {
                         clearShadowLayer()
@@ -1217,7 +1208,7 @@ class MyWatchFace : WatchFaceService() {
 
             batteryFillPaint.apply {
                 if (currentSkyState == SkyState.NIGHT) {
-                    setShadowLayer(18f, 0f, 0f, Color.parseColor("#FFFFFF"))
+                    setShadowLayer(18f, 0f, 0f, Color.WHITE)
                     alpha = 225
                 } else {
                     clearShadowLayer()
@@ -1226,7 +1217,7 @@ class MyWatchFace : WatchFaceService() {
             }
             batteryStrokePaint.apply {
                 if (currentSkyState == SkyState.NIGHT) {
-                    setShadowLayer(18f, 0f, 0f, Color.parseColor("#FFFFFF"))
+                    setShadowLayer(18f, 0f, 0f, Color.WHITE)
                     alpha = 225
                 } else {
                     clearShadowLayer()
@@ -1235,7 +1226,7 @@ class MyWatchFace : WatchFaceService() {
             }
             digitalTextPaint.apply {
                 if (currentSkyState == SkyState.NIGHT) {
-                    setShadowLayer(18f, 0f, 0f, Color.parseColor("#FFFFFF"))
+                    setShadowLayer(18f, 0f, 0f, Color.WHITE)
                     alpha = 225
                 } else {
                     clearShadowLayer()
@@ -1390,8 +1381,11 @@ class MyWatchFace : WatchFaceService() {
             }
             scope.cancel()
 
-            // Resource Cleanup to prevent memory leaks
-            currentBackgroundBitmap?.recycle()
+            // Resource Cleanup to prevent memory leaks (recycle() is idempotent,
+            // so sky/skySrc sharing an instance on 450px displays is fine)
+            currentBackgroundBitmap = null
+            sky.values.forEach { it.recycle() }
+            skySrc.values.forEach { it.recycle() }
             synchronized(rainFrames) { rainFrames.forEach { it.recycle() } }
             synchronized(snowFrames) { snowFrames.forEach { it.recycle() } }
             logoBitmap?.recycle()
