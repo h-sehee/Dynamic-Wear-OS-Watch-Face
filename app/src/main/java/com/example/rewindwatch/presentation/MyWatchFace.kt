@@ -509,7 +509,26 @@ class MyWatchFace : WatchFaceService() {
             batteryWeightId = getListId(SETTING_BATTERY_WEIGHT_ID)
 
             lastStyleUpdateTime = System.currentTimeMillis()
+            updateInteractiveTick()
             invalidate()
+        }
+
+        /**
+         * The interactive baseline redraw is 1s to save battery, but the rain/snow
+         * overlay picks its frame from the wall clock on every draw, so at 1 fps it
+         * skips 5-6 frames per tick and stutters. While an overlay is active, tick
+         * at exactly one animation frame (FRAME_DURATION_MS); otherwise stay at 1s.
+         * Ambient is unaffected — it has its own once-a-minute schedule.
+         */
+        private fun updateInteractiveTick() {
+            val animating = showWeatherAnimation && currentWeather != WeatherType.CLEAR
+            val wanted = if (animating) FRAME_DURATION_MS else 1000L
+            scope.launch(Dispatchers.Main.immediate) {
+                if (interactiveDrawModeUpdateDelayMillis != wanted) {
+                    interactiveDrawModeUpdateDelayMillis = wanted
+                    invalidate()
+                }
+            }
         }
 
         private fun getTypefaceFor(weightId: String): Typeface {
@@ -704,6 +723,7 @@ class MyWatchFace : WatchFaceService() {
             }
 
             currentWeather = newType
+            updateInteractiveTick()
         }
 
         private fun startWeatherUpdater() {
