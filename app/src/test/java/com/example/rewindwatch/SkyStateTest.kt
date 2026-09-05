@@ -40,6 +40,25 @@ class SkyStateTest {
     }
 
     @Test
+    fun scheduleFromAnEarlierDayStillClassifiesLaterDays() {
+        val day = 86_400L
+        // Next day, same clock times: the API was unreachable but the phases
+        // must not collapse into NIGHT once yesterday's sunset has passed.
+        assertEquals(SkyState.DAY, fromSunrise(day / 60 + 6 * 60))          // tomorrow noon-ish
+        assertEquals(SkyState.DAWN, fromSunrise(day / 60 - 20))             // 20 min before tomorrow's sunrise
+        assertEquals(SkyState.DAWN, fromSunrise(2 * day / 60))              // sunrise, two days later
+        assertEquals(SkyState.SUNSET, fromSunset(3 * day / 60 - 10))        // 10 min before sunset, three days later
+        assertEquals(SkyState.NIGHT, fromSunset(3 * day / 60 + 60))         // an hour after that sunset
+    }
+
+    @Test
+    fun scheduleFromALaterDayClassifiesEarlierDays() {
+        // A schedule captured for "tomorrow" (clock set forward, then corrected).
+        assertEquals(SkyState.NIGHT, fromSunrise(-2 * 60))                  // 2h before today's sunrise
+        assertEquals(SkyState.DAY, fromSunrise(-86_400 / 60 + 6 * 60))      // yesterday, mid-day
+    }
+
+    @Test
     fun fallbackScheduleClassifiesAWholeDay() {
         // Mirrors the 06:00-18:00 fallback used before the weather API answers.
         val six = 6 * 3600L

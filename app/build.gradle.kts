@@ -21,8 +21,8 @@ android {
         applicationId = "com.example.rewindwatch"
         minSdk = 30
         targetSdk = 34
-        versionCode = 7
-        versionName = "2.0.3"
+        versionCode = 8
+        versionName = "2.0.4"
         buildConfigField("String", "OPEN_WEATHER_API_KEY", "\"${localProperties["OPEN_WEATHER_API_KEY"]}\"")
     }
 

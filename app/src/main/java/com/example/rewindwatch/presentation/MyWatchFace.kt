@@ -57,23 +57,40 @@ enum class WeatherType { CLEAR, RAIN, SNOW }
  */
 data class SolarSchedule(val sunrise: Long, val sunset: Long)
 
+private const val DAY_SEC = 86_400L
+private const val DAWN_BEFORE_SEC = 30 * 60L
+private const val DAWN_AFTER_SEC = 15 * 60L
+private const val SUNSET_BEFORE_SEC = 45 * 60L
+private const val SUNSET_AFTER_SEC = 20 * 60L
+
 /**
  * Solar phase for a moment in time. Windows are asymmetric to match how the
  * transitions are perceived: dawn is brief and centred on sunrise; sunset
  * includes the golden-hour build-up and a short afterglow.
+ *
+ * The schedule's *time of day* is projected onto the day that contains `now`,
+ * so a sunrise/sunset pair from an earlier day (API unreachable, no key) still
+ * yields the right phase instead of NIGHT forever once its own sunset passed.
+ * Sunrise/sunset drift only ~1-2 min per day, so the approximation is close.
  */
 internal fun skyStateAt(nowEpochSec: Long, s: SolarSchedule): SkyState {
-    val dawnStart = s.sunrise - 30 * 60
-    val dawnEnd = s.sunrise + 15 * 60
-    val sunsetStart = s.sunset - 45 * 60
-    val sunsetEnd = s.sunset + 20 * 60
+    val k = Math.floorDiv(nowEpochSec - s.sunrise, DAY_SEC)
+    val sunrise = s.sunrise + k * DAY_SEC          // most recent sunrise at or before now
+    val dayLength = s.sunset - s.sunrise
+    val t = nowEpochSec - sunrise                  // seconds since that sunrise, in [0, DAY_SEC)
     return when {
-        nowEpochSec in dawnStart..dawnEnd -> SkyState.DAWN
-        nowEpochSec in (dawnEnd + 1)..(sunsetStart - 1) -> SkyState.DAY
-        nowEpochSec in sunsetStart..sunsetEnd -> SkyState.SUNSET
+        t <= DAWN_AFTER_SEC -> SkyState.DAWN
+        t < dayLength - SUNSET_BEFORE_SEC -> SkyState.DAY
+        t <= dayLength + SUNSET_AFTER_SEC -> SkyState.SUNSET
+        t >= DAY_SEC - DAWN_BEFORE_SEC -> SkyState.DAWN   // pre-dawn of the next sunrise
         else -> SkyState.NIGHT
     }
 }
+
+/** Elapsed-time stamps use this so a wall-clock correction can never make "now - last" negative. */
+private fun nowMs(): Long = android.os.SystemClock.elapsedRealtime()
+/** Sentinel for "never happened"; far enough back that any elapsed-time comparison reads as stale. */
+private const val NEVER_MS = Long.MIN_VALUE / 2
 
 /** ~11 km resolution: enough to debug weather lookups without logging a home address. */
 private fun coarse(v: Double): String = String.format(java.util.Locale.US, "%.1f", v)
@@ -147,6 +164,11 @@ class MyWatchFace : WatchFaceService() {
 
         // Animation Configuration
         private const val FRAME_DURATION_MS = 180L
+
+        // Last sunrise/sunset the API gave any instance. Headless thumbnail
+        // instances never fetch, so they seed from this instead of the fixed
+        // 06:00/18:00 fallback and match the live face's sky phase.
+        @Volatile private var lastKnownSchedule: SolarSchedule? = null
 
         // --- User Preferences (Toggles) ---
         @Volatile private var showTime: Boolean = true
@@ -309,9 +331,9 @@ class MyWatchFace : WatchFaceService() {
         // before hands/frame are decoded gets cached as the face's image.
         private val staticAssetsLock = Any()
         @Volatile private var staticAssetsLoaded = false
-        // Set under staticAssetsLock by onDestroy. scope.cancel() cannot interrupt
-        // a decode already running on IO; without this flag that decode would
-        // finish after teardown and assign bitmaps nobody recycles.
+        // Set by onDestroy. scope.cancel() cannot interrupt a decode already
+        // running on IO, so every loader re-checks this before publishing its
+        // bitmaps and recycles them itself if teardown happened meanwhile.
         @Volatile private var destroyed = false
 
         // --- Sensor State ---
@@ -333,15 +355,26 @@ class MyWatchFace : WatchFaceService() {
         @Volatile private var isFaceVisible = true
         @Volatile private var isAmbientNow = false
         @Volatile private var isInteractiveDrawMode = true
-        // Headless instances (editor preview, system thumbnails) render on
+        // Headless instances (picker/favourites thumbnails and other system
+        // previews; the on-watch editor renders the live instance) draw on
         // demand and never get ambient callbacks — a sensor registered there
         // would stay on until the instance dies. sensorservice showed exactly
         // that: a second listener held for ~17h overnight on v2.0.
         private val isHeadless = watchState.isHeadless
 
-        // --- Weather refresh trigger (see ACTION_REFRESH_WEATHER) ---
-        @Volatile private var lastWeatherSuccessAt = 0L   // last parsed response
-        @Volatile private var lastWeatherAttemptAt = 0L   // last fetch started (dedupe)
+        // --- Weather fetch bookkeeping (elapsedRealtime, see nowMs()) ---
+        @Volatile private var lastWeatherSuccessAt = NEVER_MS   // last response applied
+        @Volatile private var lastWeatherAttemptAt = NEVER_MS   // last fetch started (dedupe)
+        // True while the applied weather came from the "Seoul" city fallback rather
+        // than the wearer's location; the staleness gate treats fallback data as
+        // stale as soon as location permission is actually held.
+        @Volatile private var weatherIsFallback = false
+        // Every fetchRealWeather() call takes a new generation; a response only
+        // applies if its generation is still current, so a slow or retried
+        // fetch can never overwrite a newer one (e.g. Seoul retry vs. the
+        // real-location fetch issued right after a permission grant).
+        private val weatherFetchGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+        private val weatherApplyLock = Any()
         private var isRefreshReceiverRegistered = false
         private val refreshWeatherReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
@@ -363,12 +396,15 @@ class MyWatchFace : WatchFaceService() {
         }
 
         // --- Graphic Resources ---
-        // All four skies are decoded once (630px RGB_565, ~0.8 MB each) so a
-        // dawn/day/sunset/night transition is a reference swap on the UI thread,
-        // never a decode. skySrc holds the decoded originals; sky holds copies
-        // scaled to the current bounds (the same object on a 450px display).
-        private val skySrc = java.util.EnumMap<SkyState, Bitmap>(SkyState::class.java)
+        // `sky` holds one bitmap per phase, already scaled to the current bounds
+        // (630px RGB_565 on a 450px display, ~0.8 MB each). The current phase is
+        // decoded synchronously before the first frame; the other three are
+        // warmed on IO so a dawn/day/sunset/night transition is a map lookup on
+        // the UI thread, never a decode. Guarded by skyLock; skyGen is bumped
+        // whenever bounds change so an in-flight decode for old bounds is dropped.
         private val sky = java.util.EnumMap<SkyState, Bitmap>(SkyState::class.java)
+        private val skyLock = Any()
+        @Volatile private var skyGen = 0
         private var currentBackgroundBitmap: Bitmap? = null
         private var currentSkyState: SkyState = SkyState.UNKNOWN
         private val weatherDestRect = Rect()
@@ -506,7 +542,7 @@ class MyWatchFace : WatchFaceService() {
         // Reasonable fallback until the weather API responds. Anchored to
         // *today's* 06:00/18:00 instead of "now ± offset", so a watch face
         // started at 2 AM doesn't believe sunset is at 9 AM.
-        @Volatile private var solarSchedule: SolarSchedule = run {
+        @Volatile private var solarSchedule: SolarSchedule = lastKnownSchedule ?: run {
             val zone = java.time.ZoneId.systemDefault()
             val today = java.time.LocalDate.now(zone)
             SolarSchedule(
@@ -528,20 +564,14 @@ class MyWatchFace : WatchFaceService() {
             // Start async initialization
             scope.launch(Dispatchers.IO) {
                 try {
+                    // If the first frame already ran (and loaded synchronously),
+                    // this returns immediately.
                     loadStaticResources()
-                    // Force the next render to rerun updateLayoutAndScale even
-                    // if bounds haven't changed, so the freshly loaded *Src
-                    // bitmaps get scaled into the displayed bitmap fields.
-                    withContext(Dispatchers.Main.immediate) {
-                        currentWidth = 0
-                        currentHeight = 0
-                        invalidate()
-                    }
-                    // Headless instances (editor preview, picker thumbnails) only
-                    // ever draw a snapshot: skip the network fetch, the 30-min
-                    // polling loop and the ~19 MB weather frame set entirely.
-                    if (!isHeadless) fetchRealWeather()
                     withContext(Dispatchers.Main.immediate) { invalidate() }
+                    // Headless instances (picker/system thumbnails) only ever draw
+                    // a snapshot: skip the network fetch, the 30-min polling loop
+                    // and the ~19 MB weather frame set entirely.
+                    if (!isHeadless) fetchRealWeather()
                 } catch (e: Exception) {
                     Log.e(TAG, "Init load failed", e)
                 }
@@ -564,24 +594,17 @@ class MyWatchFace : WatchFaceService() {
                 watchState.isVisible.collect { visible ->
                     isFaceVisible = visible ?: true
                     syncSensorState()
-                    // delay()-based polling stalls while the watch sleeps, so a
-                    // face that just came back on screen may hold hours-old
-                    // weather. Staleness is judged on the last *successful*
-                    // response; attempts are spaced so an offline watch doesn't
-                    // retry on every wrist raise.
-                    val now = System.currentTimeMillis()
-                    if (visible == true && !isHeadless &&
-                        now - lastWeatherSuccessAt > WEATHER_REFRESH_MS &&
-                        now - lastWeatherAttemptAt > WEATHER_VISIBLE_RETRY_MS
-                    ) {
-                        scope.launch(Dispatchers.IO) { fetchRealWeather() }
-                    }
+                    if (visible == true) maybeRefetchWeather("visible")
                 }
             }
             scope.launch(Dispatchers.Main) {
                 watchState.isAmbient.collect { ambient ->
                     isAmbientNow = ambient ?: false
                     syncSensorState()
+                    // A wrist raise after hours in AOD is the moment stale weather
+                    // would be noticed; AOD counts as visible, so the visibility
+                    // collector alone would not fire here.
+                    if (ambient == false) maybeRefetchWeather("interactive")
                 }
             }
 
@@ -666,30 +689,51 @@ class MyWatchFace : WatchFaceService() {
             return Typeface.create(baseTypeface, weightVal, false)
         }
 
+        private fun hasLocationPermission(): Boolean =
+            ActivityCompat.checkSelfPermission(
+                context, Manifest.permission.ACCESS_COARSE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+
+        /**
+         * Refetch on visibility / wrist-raise when the applied weather is stale
+         * (no successful response for WEATHER_REFRESH_MS — the delay()-based loop
+         * stalls while the watch sleeps) or when it is city-fallback data but the
+         * wearer has since granted location outside our own dialog. Attempts are
+         * spaced by WEATHER_VISIBLE_RETRY_MS so an offline watch doesn't retry on
+         * every wrist raise.
+         */
+        private fun maybeRefetchWeather(reason: String) {
+            if (isHeadless) return
+            val now = nowMs()
+            val stale = now - lastWeatherSuccessAt > WEATHER_REFRESH_MS
+            val fallbackButPermitted = weatherIsFallback && hasLocationPermission()
+            if ((stale || fallbackButPermitted) && now - lastWeatherAttemptAt > WEATHER_VISIBLE_RETRY_MS) {
+                Log.d(TAG, "Weather refetch on $reason (stale=$stale, fallbackButPermitted=$fallbackButPermitted)")
+                scope.launch(Dispatchers.IO) { fetchRealWeather() }
+            }
+        }
+
         /**
          * Fetches weather data. Optimizes battery by checking cached location first.
          * Falls back to active location request if cache is empty.
-         */
-        /**
+         *
          * @param force bypass the 10s dedupe window (used right after the user
          *   grants location, where a fresh fetch is the whole point).
          */
         private fun fetchRealWeather(force: Boolean = false) {
-            val now = System.currentTimeMillis()
+            val now = nowMs()
             if (!force && now - lastWeatherAttemptAt < 10_000L) return
             lastWeatherAttemptAt = now
+            val gen = weatherFetchGeneration.incrementAndGet()
 
             if (API_KEY.isBlank() || API_KEY == "null") {
                 Log.e(TAG, "OPEN_WEATHER_API_KEY is not set in local.properties — skipping weather fetch")
                 return
             }
 
-            if (ActivityCompat.checkSelfPermission(
-                    context, Manifest.permission.ACCESS_COARSE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
+            if (!hasLocationPermission()) {
                 Log.w(TAG, "Location permission not granted — falling back to Seoul")
-                fetchWeatherByCity("Seoul")
+                fetchWeatherByCity("Seoul", gen)
                 return
             }
 
@@ -697,58 +741,58 @@ class MyWatchFace : WatchFaceService() {
             fusedLocationClient.lastLocation.addOnSuccessListener { location ->
                 if (location != null) {
                     Log.d(TAG, "Using last known location ${coarse(location.latitude)},${coarse(location.longitude)}")
-                    fetchWeatherByCoord(location.latitude, location.longitude)
+                    fetchWeatherByCoord(location.latitude, location.longitude, gen)
                 } else {
                     // 2. Request active location if cache is empty
                     fusedLocationClient.getCurrentLocation(Priority.PRIORITY_BALANCED_POWER_ACCURACY, null)
                         .addOnSuccessListener { currentLocation ->
                             if (currentLocation != null) {
                                 Log.d(TAG, "Got current location ${coarse(currentLocation.latitude)},${coarse(currentLocation.longitude)}")
-                                fetchWeatherByCoord(currentLocation.latitude, currentLocation.longitude)
+                                fetchWeatherByCoord(currentLocation.latitude, currentLocation.longitude, gen)
                             } else {
                                 Log.w(TAG, "getCurrentLocation returned null — falling back to Seoul")
-                                fetchWeatherByCity("Seoul")
+                                fetchWeatherByCity("Seoul", gen)
                             }
                         }
                         .addOnFailureListener {
                             Log.w(TAG, "getCurrentLocation failed — falling back to Seoul", it)
-                            fetchWeatherByCity("Seoul")
+                            fetchWeatherByCity("Seoul", gen)
                         }
                 }
             }.addOnFailureListener {
                 Log.w(TAG, "lastLocation failed — falling back to Seoul", it)
-                fetchWeatherByCity("Seoul")
+                fetchWeatherByCity("Seoul", gen)
             }
         }
 
-        private fun fetchWeatherByCoord(lat: Double, lon: Double) {
-            scope.launch(Dispatchers.IO) {
-                val urlString = "https://api.openweathermap.org/data/2.5/weather?lat=$lat&lon=$lon&appid=$API_KEY"
-                if (!parseAndApplyWeather(urlString)) {
-                    kotlinx.coroutines.delay(60_000L)
-                    Log.w(TAG, "Retrying weather fetch after 60s")
-                    parseAndApplyWeather(urlString)
-                }
-            }
+        private fun fetchWeatherByCoord(lat: Double, lon: Double, gen: Int) {
+            val urlString = "https://api.openweathermap.org/data/2.5/weather?lat=$lat&lon=$lon&appid=$API_KEY"
+            fetchWithRetry(urlString, gen, isFallback = false)
         }
 
-        private fun fetchWeatherByCity(city: String) {
+        private fun fetchWeatherByCity(city: String, gen: Int) {
+            val urlString = "https://api.openweathermap.org/data/2.5/weather?q=$city&appid=$API_KEY"
+            fetchWithRetry(urlString, gen, isFallback = true)
+        }
+
+        private fun fetchWithRetry(urlString: String, gen: Int, isFallback: Boolean) {
             scope.launch(Dispatchers.IO) {
-                val urlString = "https://api.openweathermap.org/data/2.5/weather?q=$city&appid=$API_KEY"
-                if (!parseAndApplyWeather(urlString)) {
-                    kotlinx.coroutines.delay(60_000L)
-                    Log.w(TAG, "Retrying weather fetch after 60s")
-                    parseAndApplyWeather(urlString)
-                }
+                if (parseAndApplyWeather(urlString, gen, isFallback)) return@launch
+                kotlinx.coroutines.delay(60_000L)
+                // A newer fetch has started meanwhile: let it win, don't retry.
+                if (gen != weatherFetchGeneration.get()) return@launch
+                Log.w(TAG, "Retrying weather fetch after 60s")
+                parseAndApplyWeather(urlString, gen, isFallback)
             }
         }
 
         /**
          * Parses JSON from OpenWeatherMap API.
          * Configured with timeouts to handle Wear OS Bluetooth proxy delays.
-         * Returns true on success, false on failure (caller may retry).
+         * Returns true when done (applied, or superseded by a newer fetch), false
+         * on failure so the caller may retry.
          */
-        private suspend fun parseAndApplyWeather(urlString: String): Boolean {
+        private suspend fun parseAndApplyWeather(urlString: String, gen: Int, isFallback: Boolean): Boolean {
             var connection: HttpURLConnection? = null
             try {
                 val url = URL(urlString)
@@ -781,17 +825,29 @@ class MyWatchFace : WatchFaceService() {
                 val sunrise = sys.getLong("sunrise")
                 val sunset = sys.getLong("sunset")
 
-                solarSchedule = SolarSchedule(sunrise, sunset)
-
                 val newWeather = when (mainWeather) {
                     "Rain", "Drizzle", "Thunderstorm" -> WeatherType.RAIN
                     "Snow" -> WeatherType.SNOW
                     else -> WeatherType.CLEAR
                 }
-                Log.d(TAG, "Weather OK: $mainWeather → $newWeather (sunrise=$sunrise, sunset=$sunset)")
 
-                updateWeatherResources(newWeather)
-                lastWeatherSuccessAt = System.currentTimeMillis()
+                // Apply atomically, and only if no newer fetch has started since
+                // this one was issued (otherwise a slow/retried response could
+                // overwrite fresher data, e.g. a Seoul retry landing after the
+                // real-location fetch that followed a permission grant).
+                synchronized(weatherApplyLock) {
+                    if (destroyed || gen != weatherFetchGeneration.get()) {
+                        Log.d(TAG, "Ignoring superseded weather response (gen $gen)")
+                        return true
+                    }
+                    val schedule = SolarSchedule(sunrise, sunset)
+                    solarSchedule = schedule
+                    lastKnownSchedule = schedule
+                    updateWeatherResources(newWeather)
+                    weatherIsFallback = isFallback
+                    lastWeatherSuccessAt = nowMs()
+                }
+                Log.d(TAG, "Weather OK: $mainWeather → $newWeather (sunrise=$sunrise, sunset=$sunset, fallback=$isFallback)")
                 withContext(Dispatchers.Main) { invalidate() }
                 return true
             } catch (e: Exception) {
@@ -809,7 +865,7 @@ class MyWatchFace : WatchFaceService() {
          * ≈ 19 MB — well below the ~48 MB that once OOM'd with all frames at full size.
          */
         private fun updateWeatherResources(newType: WeatherType) {
-            if (currentWeather == newType) return
+            if (currentWeather == newType || destroyed) return
 
             synchronized(rainFrames) { rainFrames.forEach { it.recycle() }; rainFrames.clear() }
             synchronized(snowFrames) { snowFrames.forEach { it.recycle() }; snowFrames.clear() }
@@ -824,20 +880,21 @@ class MyWatchFace : WatchFaceService() {
                 loadAnimationFrames(tempFrames, "snow_", 40, options)
             }
 
-            // 2. Safely swap lists and recycle unused bitmaps
+            // 2. Safely swap lists and recycle unused bitmaps. The `destroyed`
+            // check sits inside the list lock: onDestroy recycles under the same
+            // lock, so a decode that finishes during teardown either publishes
+            // before onDestroy clears the list, or sees the flag and drops its
+            // frames itself — never both, never neither.
+            fun swapInto(target: MutableList<Bitmap>) = synchronized(target) {
+                target.forEach { it.recycle() }
+                target.clear()
+                if (destroyed) tempFrames.forEach { it.recycle() } else target.addAll(tempFrames)
+            }
             if (newType == WeatherType.RAIN) {
-                synchronized(rainFrames) {
-                    rainFrames.forEach { it.recycle() }
-                    rainFrames.clear()
-                    rainFrames.addAll(tempFrames)
-                }
+                swapInto(rainFrames)
                 synchronized(snowFrames) { snowFrames.forEach { it.recycle() }; snowFrames.clear() }
             } else if (newType == WeatherType.SNOW) {
-                synchronized(snowFrames) {
-                    snowFrames.forEach { it.recycle() }
-                    snowFrames.clear()
-                    snowFrames.addAll(tempFrames)
-                }
+                swapInto(snowFrames)
                 synchronized(rainFrames) { rainFrames.forEach { it.recycle() }; rainFrames.clear() }
             } else {
                 // CLEAR weather: Release all memory
@@ -853,17 +910,24 @@ class MyWatchFace : WatchFaceService() {
             scope.launch(Dispatchers.IO) {
                 while (true) {
                     kotlinx.coroutines.delay(WEATHER_REFRESH_MS)
-                    fetchRealWeather()
-                    withContext(Dispatchers.Main) { invalidate() }
+                    // Skip while nothing is drawn (other app in front, charging
+                    // with the screen off); the visibility/wrist-raise refetch
+                    // covers the return. Also skip if a refetch already ran
+                    // recently so the two paths don't double up.
+                    if (isFaceVisible && nowMs() - lastWeatherSuccessAt >= WEATHER_REFRESH_MS) {
+                        fetchRealWeather()
+                        withContext(Dispatchers.Main) { invalidate() }
+                    }
                 }
             }
         }
 
         /**
-         * Loads static assets at full resolution. Each 500x500 asset is ~1 MB,
-         * total ~6 MB — well below OOM. Originals are kept in *Src fields so
-         * updateLayoutAndScale always resamples from the original instead of
-         * compounding scale operations.
+         * Loads the hands/frame/logo at full resolution. Each 500x500 asset is
+         * ~1 MB. Originals are kept in *Src fields so updateLayoutAndScale always
+         * resamples from the original instead of compounding scale operations.
+         * Decodes are published in one step under the lock and dropped if
+         * onDestroy ran meanwhile, so teardown never leaks them.
          */
         private fun loadStaticResources() = synchronized(staticAssetsLock) {
             if (staticAssetsLoaded || destroyed) return@synchronized
@@ -874,44 +938,106 @@ class MyWatchFace : WatchFaceService() {
                 null
             }
 
-            logoBitmapSrc = decode(R.drawable.logo_rewind)
-            hourHandBitmapSrc = decode(R.drawable.hand_hour)
-            minuteHandBitmapSrc = decode(R.drawable.hand_min)
-            centerUnderBitmapSrc = decode(R.drawable.center_under)
-            centerOverBitmapSrc = decode(R.drawable.center_over)
-
+            val logo = decode(R.drawable.logo_rewind)
+            val hour = decode(R.drawable.hand_hour)
+            val minute = decode(R.drawable.hand_min)
+            val centerUnder = decode(R.drawable.center_under)
+            val centerOver = decode(R.drawable.center_over)
             val frameCenterId = res.getIdentifier("frame_center", "drawable", packageName)
                 .takeIf { it != 0 }
                 ?: res.getIdentifier("frame_left", "drawable", packageName)
-            frameCenterSrc = if (frameCenterId != 0) decode(frameCenterId) else null
+            val frame = if (frameCenterId != 0) decode(frameCenterId) else null
 
-            // Skies ship as 1260px centre-cropped squares; inSampleSize=2 lands
-            // exactly on the 630px (1.4x of 450) the parallax margin needs.
-            val skyOptions = BitmapFactory.Options().apply {
-                inPreferredConfig = Bitmap.Config.RGB_565
-                inSampleSize = 2
+            if (destroyed) {
+                listOf(logo, hour, minute, centerUnder, centerOver, frame).forEach { it?.recycle() }
+                return@synchronized
             }
-            fun decodeSky(state: SkyState, resId: Int) {
-                try {
-                    BitmapFactory.decodeResource(res, resId, skyOptions)?.let { skySrc[state] = it }
-                } catch (e: Exception) {
-                    Log.w(TAG, "sky decode failed for $state", e)
-                }
-            }
-            decodeSky(SkyState.DAWN, R.drawable.bg_sky_dawn)
-            decodeSky(SkyState.DAY, R.drawable.bg_sky_blue)
-            decodeSky(SkyState.SUNSET, R.drawable.bg_sky_sunset)
-            decodeSky(SkyState.NIGHT, R.drawable.bg_sky_night)
+            logoBitmapSrc = logo
+            hourHandBitmapSrc = hour
+            minuteHandBitmapSrc = minute
+            centerUnderBitmapSrc = centerUnder
+            centerOverBitmapSrc = centerOver
+            frameCenterSrc = frame
             staticAssetsLoaded = true
         }
 
-        /** Swaps the sky bitmap when the solar phase changes. UI thread, no I/O. */
-        private fun updateBackgroundForTime() {
-            val newState = skyStateAt(Instant.now().epochSecond, solarSchedule)
-            if (newState != currentSkyState) {
-                currentSkyState = newState
-                currentBackgroundBitmap = sky[newState] ?: sky[SkyState.NIGHT]
+        private fun skyResId(state: SkyState): Int = when (state) {
+            SkyState.DAWN -> R.drawable.bg_sky_dawn
+            SkyState.DAY -> R.drawable.bg_sky_blue
+            SkyState.SUNSET -> R.drawable.bg_sky_sunset
+            else -> R.drawable.bg_sky_night
+        }
+
+        /**
+         * Returns the sky bitmap for [state] at the current bounds, decoding it if
+         * it isn't cached yet. Safe from any thread: the decode runs outside the
+         * lock, and the result is discarded if bounds changed or the renderer was
+         * destroyed while it was in flight.
+         */
+        private fun ensureSky(state: SkyState): Bitmap? {
+            synchronized(skyLock) { sky[state]?.let { if (!it.isRecycled) return it } }
+            val gen = skyGen
+            val w = currentWidth
+            val h = currentHeight
+            if (w <= 0 || h <= 0 || destroyed) return null
+
+            // Skies ship as 1260px centre-cropped squares; inSampleSize=2 lands
+            // exactly on the 630px (1.4x of 450) the parallax margin needs.
+            val options = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.RGB_565
+                inSampleSize = 2
             }
+            val decoded = try {
+                BitmapFactory.decodeResource(res, skyResId(state), options)
+            } catch (e: Exception) {
+                Log.w(TAG, "sky decode failed for $state", e); null
+            } ?: return null
+            val scaled = getScaledBackground(decoded, w, h)
+            if (scaled !== decoded) decoded.recycle()
+
+            synchronized(skyLock) {
+                if (destroyed || gen != skyGen) {
+                    scaled.recycle()
+                    return null
+                }
+                sky[state]?.let { existing ->      // lost a race with another loader
+                    if (!existing.isRecycled) { scaled.recycle(); return existing }
+                }
+                sky[state] = scaled
+                return scaled
+            }
+        }
+
+        /**
+         * Bounds changed (or first layout): drop every cached sky, decode the
+         * current phase now so this frame has a background, and warm the other
+         * three on IO. Headless thumbnail instances draw once, so they skip the
+         * warm-up — one sky is all they ever need.
+         */
+        private fun rebuildSkies() {
+            synchronized(skyLock) {
+                skyGen++
+                sky.values.forEach { it.recycle() }
+                sky.clear()
+            }
+            currentBackgroundBitmap = null
+            val current = skyStateAt(Instant.now().epochSecond, solarSchedule)
+            ensureSky(current)
+            if (!isHeadless) {
+                scope.launch(Dispatchers.IO) {
+                    for (state in listOf(SkyState.DAWN, SkyState.DAY, SkyState.SUNSET, SkyState.NIGHT)) {
+                        if (state != current) ensureSky(state)
+                    }
+                }
+            }
+        }
+
+        /** Points the background at the sky for the current solar phase. UI thread. */
+        private fun updateBackgroundForTime() {
+            val state = skyStateAt(Instant.now().epochSecond, solarSchedule)
+            currentSkyState = state
+            currentBackgroundBitmap =
+                synchronized(skyLock) { sky[state]?.takeIf { !it.isRecycled } } ?: ensureSky(state)
         }
 
         /**
@@ -967,8 +1093,9 @@ class MyWatchFace : WatchFaceService() {
         private fun updateLayoutAndScale(width: Int, height: Int) {
             if (width <= 0 || height <= 0) return
             // First frame before the IO preload finished (or a headless snapshot
-            // instance): decode synchronously now (~100ms, once) rather than
-            // draw a face with no hands/frame.
+            // instance): decode the hands/frame synchronously now (~60ms, once)
+            // rather than draw a face without them. The current sky is decoded
+            // by rebuildSkies() below; the other skies warm up on IO.
             if (!staticAssetsLoaded) loadStaticResources()
             if (width == currentWidth && height == currentHeight) {
                 updateBackgroundForTime()
@@ -980,15 +1107,7 @@ class MyWatchFace : WatchFaceService() {
             screenCenterX = width / 2f
             screenCenterY = height / 2f
 
-            // Skies: always rescale from the decoded original so a bounds change
-            // never resamples an already-resampled bitmap.
-            for ((state, src) in skySrc) {
-                val old = sky[state]
-                val scaled = getScaledBackground(src, width, height)
-                sky[state] = scaled
-                if (old != null && old !== scaled && old !== src) old.recycle()
-            }
-            currentSkyState = SkyState.UNKNOWN   // force the swap below to pick the new bitmap
+            rebuildSkies()
             updateBackgroundForTime()
 
             // Always rescale from the *Src original — never from a previously
@@ -1417,6 +1536,9 @@ class MyWatchFace : WatchFaceService() {
 
         override fun onDestroy() {
             super.onDestroy()
+            // Published first (volatile) so any decode still running on IO drops
+            // its result instead of assigning after this point.
+            destroyed = true
             sensorManager.unregisterListener(this)
             try { context.unregisterReceiver(batteryReceiver) } catch (e: Exception) {}
             if (isRefreshReceiverRegistered) {
@@ -1424,17 +1546,16 @@ class MyWatchFace : WatchFaceService() {
             }
             scope.cancel()
 
-            // Resource cleanup. Taking staticAssetsLock means a decode that is
-            // still running on IO finishes (and its results are assigned) before
-            // we recycle, and any load that hasn't started yet sees `destroyed`.
-            // recycle() is idempotent, so sky/skySrc sharing an instance is fine.
-            synchronized(staticAssetsLock) {
-                destroyed = true
+            synchronized(skyLock) {
                 currentBackgroundBitmap = null
                 sky.values.forEach { it.recycle() }
-                skySrc.values.forEach { it.recycle() }
-                synchronized(rainFrames) { rainFrames.forEach { it.recycle() } }
-                synchronized(snowFrames) { snowFrames.forEach { it.recycle() } }
+                sky.clear()
+            }
+            synchronized(rainFrames) { rainFrames.forEach { it.recycle() }; rainFrames.clear() }
+            synchronized(snowFrames) { snowFrames.forEach { it.recycle() }; snowFrames.clear() }
+            // Brief: the loader holds this lock only for its ~60 ms of PNG decodes
+            // and publishes nothing once `destroyed` is set.
+            synchronized(staticAssetsLock) {
                 listOf(
                     logoBitmap, frameCenter, hourHandBitmap, minuteHandBitmap,
                     centerUnderBitmap, centerOverBitmap,
