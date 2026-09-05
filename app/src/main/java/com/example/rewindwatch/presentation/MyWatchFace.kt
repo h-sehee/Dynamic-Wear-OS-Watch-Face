@@ -690,7 +690,9 @@ class MyWatchFace : WatchFaceService() {
 
         /**
          * Efficiently loads or unloads weather animation bitmaps based on the weather type.
-         * Uses inSampleSize = 2 to prevent OutOfMemory errors with high-res assets.
+         * Frames are shipped at 500x500 and decoded at full size; only the even-numbered
+         * frames exist in the APK (the odd ones were never drawn), so a set is ~19 frames
+         * ≈ 19 MB — well below the ~48 MB that once OOM'd with all frames at full size.
          */
         private fun updateWeatherResources(newType: WeatherType) {
             if (currentWeather == newType) return
@@ -698,9 +700,9 @@ class MyWatchFace : WatchFaceService() {
             synchronized(rainFrames) { rainFrames.forEach { it.recycle() }; rainFrames.clear() }
             synchronized(snowFrames) { snowFrames.forEach { it.recycle() }; snowFrames.clear() }
 
-            // 1. Load into temporary list with downsampling (1/2 size)
+            // 1. Load into a temporary list at full resolution
             val tempFrames = ArrayList<Bitmap>()
-            val options = BitmapFactory.Options().apply { inSampleSize = 2 } // CRITICAL: Fix for 48MB allocation error
+            val options = BitmapFactory.Options()
 
             if (newType == WeatherType.RAIN) {
                 loadAnimationFrames(tempFrames, "rain_", 38, options)
