@@ -24,10 +24,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
@@ -231,6 +233,48 @@ fun EditWatchFaceScreen(session: EditorSession) {
 }
 
 /**
+ * Dim overlay with a transparent hole and a blinking highlight border. Every
+ * editor page uses it to point at the element being edited; pages supply only
+ * the hole's geometry, so colour, opacity and blink cadence live in one place.
+ */
+@Composable
+private fun CutoutOverlay(cutout: DrawScope.() -> Rect) {
+    val infiniteTransition = rememberInfiniteTransition()
+    val blinkAlpha by infiniteTransition.animateFloat(
+        initialValue = 1f,
+        targetValue = 0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        )
+    )
+
+    Canvas(
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen } // required for BlendMode.Clear
+    ) {
+        drawRect(color = Color.Black.copy(alpha = 0.6f))
+        val hole = cutout()
+        val corner = CornerRadius(2.dp.toPx())
+        drawRoundRect(
+            color = Color.Transparent,
+            topLeft = hole.topLeft,
+            size = hole.size,
+            cornerRadius = corner,
+            blendMode = BlendMode.Clear
+        )
+        drawRoundRect(
+            color = Color(0xFF5F97FF).copy(alpha = blinkAlpha),
+            topLeft = hole.topLeft,
+            size = hole.size,
+            cornerRadius = corner,
+            style = Stroke(width = 1.5.dp.toPx())
+        )
+    }
+}
+
+/**
  * Font Style Page with Visual Cutout
  * Renders a dim overlay with a hole in the center to highlight the watch face content.
  */
@@ -242,15 +286,6 @@ fun FontStyleVisualPage(
 ) {
     val vPagerState = rememberPagerState(initialPage = selectedIndex, pageCount = { optionsCount })
 
-    val infiniteTransition = rememberInfiniteTransition()
-    val blinkAlpha by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1000, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
 
 
     LaunchedEffect(vPagerState.currentPage) {
@@ -258,38 +293,14 @@ fun FontStyleVisualPage(
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // 1. Cutout Background (Dark overlay with a clear hole)
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen } // Essential for BlendMode.Clear
-        ) {
-            // Draw standard dim background
-            drawRect(color = Color.Black.copy(alpha = 0.6f))
-
+        // 1. Dim overlay with a hole over the element this page edits
+        CutoutOverlay {
             // Calculate cutout area (Center rectangle, approx size for a clock)
             val cutoutWidth = size.width * 0.4f
             val cutoutHeight = size.height * 0.32f
             val left = (size.width - cutoutWidth) / 2
             val top = (size.height - cutoutHeight) / 2 + 9 * (size.height / 450f)
-
-            // Punch the hole (Clear mode)
-            drawRoundRect(
-                color = Color.Transparent,
-                topLeft = Offset(left, top),
-                size = Size(cutoutWidth, cutoutHeight),
-                cornerRadius = CornerRadius(2.dp.toPx()),
-                blendMode = BlendMode.Clear
-            )
-
-            // Draw Blue Highlight Border
-            drawRoundRect(
-                color = Color(0xFF5F97FF).copy(alpha = blinkAlpha),
-                topLeft = Offset(left, top),
-                size = Size(cutoutWidth, cutoutHeight),
-                cornerRadius = CornerRadius(2.dp.toPx()),
-                style = Stroke(width = 1.5.dp.toPx())
-            )
+            Rect(Offset(left, top), Size(cutoutWidth, cutoutHeight))
         }
 
         // 2. Invisible Pager for gestures
@@ -319,51 +330,18 @@ fun TimeAndSecondsPage(
     onTimeCheckChanged: (Boolean) -> Unit, onSecondsCheckChanged: (Boolean) -> Unit, onTimeWeightChanged: (Int) -> Unit
 ) {
     val vPagerState = rememberPagerState(initialPage = timeWeightIndex, pageCount = { 4 })
-    val infiniteTransition = rememberInfiniteTransition()
-    val blinkAlpha by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1000, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
 
     LaunchedEffect(vPagerState.currentPage) { if (vPagerState.currentPage != timeWeightIndex) onTimeWeightChanged(vPagerState.currentPage) }
 
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        // 1. Cutout Background (Dark overlay with a clear hole)
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen } // Essential for BlendMode.Clear
-        ) {
-            // Draw standard dim background
-            drawRect(color = Color.Black.copy(alpha = 0.6f))
-
+        // 1. Dim overlay with a hole over the element this page edits
+        CutoutOverlay {
             // Calculate cutout area (Center rectangle, approx size for a clock)
             val cutoutWidth = size.width * 0.4f
             val cutoutHeight = size.height * 0.15f
             val left = (size.width - cutoutWidth) / 2
             val top = (size.height - cutoutHeight) / 3 + 23 * (size.height / 450f)
-
-            // Punch the hole (Clear mode)
-            drawRoundRect(
-                color = Color.Transparent,
-                topLeft = Offset(left, top),
-                size = Size(cutoutWidth, cutoutHeight),
-                cornerRadius = CornerRadius(2.dp.toPx()),
-                blendMode = BlendMode.Clear
-            )
-
-            // Draw Blue Highlight Border
-            drawRoundRect(
-                color = Color(0xFF5F97FF).copy(alpha = blinkAlpha),
-                topLeft = Offset(left, top),
-                size = Size(cutoutWidth, cutoutHeight),
-                cornerRadius = CornerRadius(2.dp.toPx()),
-                style = Stroke(width = 1.5.dp.toPx())
-            )
+            Rect(Offset(left, top), Size(cutoutWidth, cutoutHeight))
         }
 
         VerticalPager(state = vPagerState, modifier = Modifier.fillMaxSize()) { Box(modifier = Modifier.fillMaxSize().background(Color.Transparent)) }
@@ -428,28 +406,12 @@ fun VerticalSwitchWeightPage(
     onWeightChanged: (Int) -> Unit
 ) {
     val vPagerState = rememberPagerState(initialPage = weightIndex, pageCount = { 4 })
-    val infiniteTransition = rememberInfiniteTransition()
-    val blinkAlpha by infiniteTransition.animateFloat(
-        initialValue = 1f,
-        targetValue = 0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1000, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
 
     LaunchedEffect(vPagerState.currentPage) { if (vPagerState.currentPage != weightIndex) onWeightChanged(vPagerState.currentPage) }
 
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        // 1. Cutout Background (Dark overlay with a clear hole)
-        Canvas(
-            modifier = Modifier
-                .fillMaxSize()
-                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen } // Essential for BlendMode.Clear
-        ) {
-            // Draw standard dim background
-            drawRect(color = Color.Black.copy(alpha = 0.6f))
-
+        // 1. Dim overlay with a hole over the element this page edits
+        CutoutOverlay {
             // Calculate cutout area
             val cutoutWidth = if (currentPage == 1) size.width * 0.25f else size.width * 0.2f
             val cutoutHeight = if (currentPage == 1) size.height * 0.1f else size.height * 0.1f
@@ -468,24 +430,7 @@ fun VerticalSwitchWeightPage(
                     baseTop - 18 * (size.height / 450f)
                 }
             }
-
-            // Punch the hole (Clear mode)
-            drawRoundRect(
-                color = Color.Transparent,
-                topLeft = Offset(left, top),
-                size = Size(cutoutWidth, cutoutHeight),
-                cornerRadius = CornerRadius(2.dp.toPx()),
-                blendMode = BlendMode.Clear
-            )
-
-            // Draw Blue Highlight Border
-            drawRoundRect(
-                color = Color(0xFF5F97FF).copy(alpha = blinkAlpha),
-                topLeft = Offset(left, top),
-                size = Size(cutoutWidth, cutoutHeight),
-                cornerRadius = CornerRadius(2.dp.toPx()),
-                style = Stroke(width = 1.5.dp.toPx())
-            )
+            Rect(Offset(left, top), Size(cutoutWidth, cutoutHeight))
         }
 
         VerticalPager(state = vPagerState, modifier = Modifier.fillMaxSize()) { Box(modifier = Modifier.fillMaxSize().background(Color.Transparent)) }

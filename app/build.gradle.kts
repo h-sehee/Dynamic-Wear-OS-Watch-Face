@@ -80,6 +80,7 @@ dependencies {
     implementation("androidx.wear.watchface:watchface-editor:1.2.1")
     implementation("androidx.wear.compose:compose-foundation:1.5.6")
     implementation("androidx.wear.compose:compose-material:1.5.6")
+    testImplementation("junit:junit:4.13.2")
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.ui.test.junit4)
     debugImplementation(libs.ui.tooling)
