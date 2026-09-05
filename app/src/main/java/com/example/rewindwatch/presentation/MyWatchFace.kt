@@ -140,6 +140,10 @@ class MyWatchFace : WatchFaceService() {
         // Weather refresh cadence; also the staleness threshold used when the
         // face becomes visible again after the watch slept through the timer.
         private const val WEATHER_REFRESH_MS = 30 * 60 * 1000L
+        // While weather is stale (e.g. offline), visibility-triggered refetches
+        // are spaced at least this far apart so wrist raises don't hammer the
+        // network; the 30-min loop and the permission broadcast are unaffected.
+        private const val WEATHER_VISIBLE_RETRY_MS = 5 * 60 * 1000L
 
         // Animation Configuration
         private const val FRAME_DURATION_MS = 180L
@@ -336,7 +340,8 @@ class MyWatchFace : WatchFaceService() {
         private val isHeadless = watchState.isHeadless
 
         // --- Weather refresh trigger (see ACTION_REFRESH_WEATHER) ---
-        @Volatile private var lastWeatherFetchAt = 0L
+        @Volatile private var lastWeatherSuccessAt = 0L   // last parsed response
+        @Volatile private var lastWeatherAttemptAt = 0L   // last fetch started (dedupe)
         private var isRefreshReceiverRegistered = false
         private val refreshWeatherReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
@@ -561,9 +566,13 @@ class MyWatchFace : WatchFaceService() {
                     syncSensorState()
                     // delay()-based polling stalls while the watch sleeps, so a
                     // face that just came back on screen may hold hours-old
-                    // weather. fetchRealWeather() itself dedupes bursts.
+                    // weather. Staleness is judged on the last *successful*
+                    // response; attempts are spaced so an offline watch doesn't
+                    // retry on every wrist raise.
+                    val now = System.currentTimeMillis()
                     if (visible == true && !isHeadless &&
-                        System.currentTimeMillis() - lastWeatherFetchAt > WEATHER_REFRESH_MS
+                        now - lastWeatherSuccessAt > WEATHER_REFRESH_MS &&
+                        now - lastWeatherAttemptAt > WEATHER_VISIBLE_RETRY_MS
                     ) {
                         scope.launch(Dispatchers.IO) { fetchRealWeather() }
                     }
@@ -667,8 +676,8 @@ class MyWatchFace : WatchFaceService() {
          */
         private fun fetchRealWeather(force: Boolean = false) {
             val now = System.currentTimeMillis()
-            if (!force && now - lastWeatherFetchAt < 10_000L) return
-            lastWeatherFetchAt = now
+            if (!force && now - lastWeatherAttemptAt < 10_000L) return
+            lastWeatherAttemptAt = now
 
             if (API_KEY.isBlank() || API_KEY == "null") {
                 Log.e(TAG, "OPEN_WEATHER_API_KEY is not set in local.properties — skipping weather fetch")
@@ -782,6 +791,7 @@ class MyWatchFace : WatchFaceService() {
                 Log.d(TAG, "Weather OK: $mainWeather → $newWeather (sunrise=$sunrise, sunset=$sunset)")
 
                 updateWeatherResources(newWeather)
+                lastWeatherSuccessAt = System.currentTimeMillis()
                 withContext(Dispatchers.Main) { invalidate() }
                 return true
             } catch (e: Exception) {
