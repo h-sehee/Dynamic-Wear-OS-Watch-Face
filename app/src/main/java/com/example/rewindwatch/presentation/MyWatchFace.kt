@@ -238,6 +238,13 @@ class MyWatchFace : WatchFaceService() {
         private val bitmapLock = Any()
         private var lastStyleUpdateTime = 0L
 
+        // Static assets are preloaded on IO, but the very first render must
+        // never race that load: the system snapshots a headless instance right
+        // after creation for the favorites/picker thumbnail, and a frame drawn
+        // before hands/frame are decoded gets cached as the face's image.
+        private val staticAssetsLock = Any()
+        @Volatile private var staticAssetsLoaded = false
+
         // --- Sensor State ---
         private var gyroX = 0f
         private var gyroY = 0f
@@ -742,7 +749,8 @@ class MyWatchFace : WatchFaceService() {
          * updateLayoutAndScale always resamples from the original instead of
          * compounding scale operations.
          */
-        private fun loadStaticResources() {
+        private fun loadStaticResources() = synchronized(staticAssetsLock) {
+            if (staticAssetsLoaded) return@synchronized
             fun decode(resId: Int): Bitmap? = try {
                 BitmapFactory.decodeResource(res, resId, null)
             } catch (e: Exception) {
@@ -760,6 +768,7 @@ class MyWatchFace : WatchFaceService() {
                 .takeIf { it != 0 }
                 ?: res.getIdentifier("frame_left", "drawable", packageName)
             frameCenterSrc = if (frameCenterId != 0) decode(frameCenterId) else null
+            staticAssetsLoaded = true
         }
 
         /**
@@ -883,6 +892,10 @@ class MyWatchFace : WatchFaceService() {
 
         private fun updateLayoutAndScale(width: Int, height: Int) {
             if (width <= 0 || height <= 0) return
+            // First frame before the IO preload finished (or a headless snapshot
+            // instance): decode synchronously now (~100ms, once) rather than
+            // draw a face with no hands/frame.
+            if (!staticAssetsLoaded) loadStaticResources()
             if (width == currentWidth && height == currentHeight) {
                 updateBackgroundForTime()
                 return
