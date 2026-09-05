@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Resources the shrinker cannot see: MyWatchFace looks these up by name at
+  runtime via Resources.getIdentifier() (rain_N / snow_N frames, and the
+  frame_center -> frame_left fallback), so there is no static R.drawable
+  reference for R8 to follow.
+-->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@drawable/rain_*,@drawable/snow_*,@drawable/frame_center,@drawable/frame_left" />

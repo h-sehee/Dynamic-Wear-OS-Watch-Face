@@ -1,21 +1,11 @@
-# Add project specific ProGuard rules here.
-# You can control the set of applied configuration files using the
-# proguardFiles setting in build.gradle.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools/proguard.html
+# --- RewindWatch R8 rules ---
+# Manifest-declared components (MyWatchFace, MainActivity) are kept automatically.
+# Watch Face Format / androidx.wear.watchface ship their own consumer rules.
 
-# If your project uses WebView with JS, uncomment the following
-# and specify the fully qualified class name to the JavaScript interface
-# class:
-#-keepclassmembers class fqcn.of.javascript.interface.for.webview {
-#   public *;
-#}
+# UserStyle settings are looked up by string id at runtime; keep their
+# option classes intact so the editor <-> service handshake keeps working.
+-keep class androidx.wear.watchface.style.** { *; }
 
-# Uncomment this to preserve the line number information for
-# debugging stack traces.
-#-keepattributes SourceFile,LineNumberTable
-
-# If you keep the line number information, uncomment this to
-# hide the original source file name.
-#-renamesourcefileattribute SourceFile
+# We log exception class names; keep them readable in logcat.
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
