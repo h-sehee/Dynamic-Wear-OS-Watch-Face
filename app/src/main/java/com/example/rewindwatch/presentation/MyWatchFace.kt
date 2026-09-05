@@ -249,6 +249,20 @@ class MyWatchFace : WatchFaceService() {
         private var lastInvalidatedGyroY = 0f
         private var lastSensorInvalidateAt = 0L
 
+        // The accelerometer must be off whenever the face isn't actually on
+        // screen — a registered listener keeps the SoC out of deep sleep even
+        // when nothing is drawn. drawMode alone misses the "not visible but
+        // still interactive" case (another app in front, screen off without
+        // AOD), so visibility and ambient are tracked separately.
+        @Volatile private var isFaceVisible = true
+        @Volatile private var isAmbientNow = false
+        @Volatile private var isInteractiveDrawMode = true
+        // Headless instances (editor preview, system thumbnails) render on
+        // demand and never get ambient callbacks — a sensor registered there
+        // would stay on until the instance dies. sensorservice showed exactly
+        // that: a second listener held for ~17h overnight on v2.0.
+        private val isHeadless = watchState.isHeadless
+
         // --- Battery State ---
         private var batteryLevel = 100
         private val batteryReceiver = object : BroadcastReceiver() {
@@ -342,7 +356,10 @@ class MyWatchFace : WatchFaceService() {
         private val grayScalePaint = Paint().apply {
             val matrix = ColorMatrix()
             matrix.setSaturation(0f)
-            val scale = 0.6f
+            // AOD is on ~16h/day and OLED power scales with lit brightness,
+            // so this is the single biggest battery lever. 0.4 ≈ Samsung's
+            // stock AOD faces; still readable indoors.
+            val scale = 0.4f
             val darkMatrix = ColorMatrix(floatArrayOf(
                 scale, 0f, 0f, 0f, 0f,
                 0f, scale, 0f, 0f, 0f,
@@ -443,6 +460,20 @@ class MyWatchFace : WatchFaceService() {
             scope.launch(Dispatchers.Main) {
                 currentUserStyleRepository.userStyle.collect { userStyle ->
                     updateWatchFaceStyle(userStyle)
+                }
+            }
+
+            // Gate the accelerometer on real visibility, not just drawMode.
+            scope.launch(Dispatchers.Main) {
+                watchState.isVisible.collect { visible ->
+                    isFaceVisible = visible ?: true
+                    syncSensorState()
+                }
+            }
+            scope.launch(Dispatchers.Main) {
+                watchState.isAmbient.collect { ambient ->
+                    isAmbientNow = ambient ?: false
+                    syncSensorState()
                 }
             }
 
@@ -1243,21 +1274,21 @@ class MyWatchFace : WatchFaceService() {
 
         override fun onRenderParametersChanged(renderParameters: RenderParameters) {
             super.onRenderParametersChanged(renderParameters)
-            updateSensorState(renderParameters.drawMode)
+            isInteractiveDrawMode = renderParameters.drawMode == DrawMode.INTERACTIVE
+            syncSensorState()
         }
 
-        private fun updateSensorState(drawMode: DrawMode) {
-            if (drawMode == DrawMode.INTERACTIVE) {
-                if (!isSensorRegistered) {
-                    needsReset = true
-                    sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_GAME)
-                    isSensorRegistered = true
-                }
-            } else {
-                if (isSensorRegistered) {
-                    sensorManager.unregisterListener(this)
-                    isSensorRegistered = false
-                }
+        private fun syncSensorState() {
+            val shouldRun = !isHeadless && isFaceVisible && !isAmbientNow && isInteractiveDrawMode
+            if (shouldRun && !isSensorRegistered) {
+                needsReset = true
+                // 50Hz keeps the parallax fluid; the sensor is only live while
+                // the face is actually on screen, so this costs little.
+                sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_GAME)
+                isSensorRegistered = true
+            } else if (!shouldRun && isSensorRegistered) {
+                sensorManager.unregisterListener(this)
+                isSensorRegistered = false
             }
         }
 
