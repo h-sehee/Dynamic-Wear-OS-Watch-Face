@@ -337,14 +337,14 @@ class MyWatchFace : WatchFaceService() {
         @Volatile private var destroyed = false
 
         // --- Sensor State ---
-        private var gyroX = 0f
-        private var gyroY = 0f
+        private var tiltX = 0f
+        private var tiltY = 0f
         private var baseX = 0f
         private var baseY = 0f
         private var needsReset = true
         private var isSensorRegistered = false
-        private var lastInvalidatedGyroX = 0f
-        private var lastInvalidatedGyroY = 0f
+        private var lastInvalidatedTiltX = 0f
+        private var lastInvalidatedTiltY = 0f
         private var lastSensorInvalidateAt = 0L
 
         // The accelerometer must be off whenever the face isn't actually on
@@ -1188,8 +1188,8 @@ class MyWatchFace : WatchFaceService() {
         }
 
         private fun drawInteractive(canvas: Canvas, zonedDateTime: ZonedDateTime) {
-            val diffX = (gyroX - baseX).coerceIn(-TILT_LIMIT, TILT_LIMIT)
-            val diffY = (gyroY - baseY).coerceIn(-TILT_LIMIT, TILT_LIMIT)
+            val diffX = (tiltX - baseX).coerceIn(-TILT_LIMIT, TILT_LIMIT)
+            val diffY = (tiltY - baseY).coerceIn(-TILT_LIMIT, TILT_LIMIT)
 
             // 1. Draw Background (Parallax Effect)
             val bg = currentBackgroundBitmap
@@ -1513,20 +1513,20 @@ class MyWatchFace : WatchFaceService() {
                 baseY = y
                 needsReset = false
             }
-            gyroX = gyroX * (1f - SENSOR_SMOOTHING) + x * SENSOR_SMOOTHING
-            gyroY = gyroY * (1f - SENSOR_SMOOTHING) + y * SENSOR_SMOOTHING
+            tiltX = tiltX * (1f - SENSOR_SMOOTHING) + x * SENSOR_SMOOTHING
+            tiltY = tiltY * (1f - SENSOR_SMOOTHING) + y * SENSOR_SMOOTHING
 
             // Only repaint when tilt meaningfully changed and at most ~30Hz.
             // Eliminates the previous ~50Hz invalidate flood when the wrist
             // was sitting still (sensor still fires but values barely move).
-            val dx = Math.abs(gyroX - lastInvalidatedGyroX)
-            val dy = Math.abs(gyroY - lastInvalidatedGyroY)
+            val dx = Math.abs(tiltX - lastInvalidatedTiltX)
+            val dy = Math.abs(tiltY - lastInvalidatedTiltY)
             val now = System.currentTimeMillis()
             if ((dx > REDRAW_TILT_THRESHOLD || dy > REDRAW_TILT_THRESHOLD) &&
                 now - lastSensorInvalidateAt > REDRAW_MIN_INTERVAL_MS
             ) {
-                lastInvalidatedGyroX = gyroX
-                lastInvalidatedGyroY = gyroY
+                lastInvalidatedTiltX = tiltX
+                lastInvalidatedTiltY = tiltY
                 lastSensorInvalidateAt = now
                 invalidate()
             }
