@@ -78,6 +78,42 @@ internal fun skyStateAt(nowEpochSec: Long, s: SolarSchedule): SkyState {
 /** ~11 km resolution: enough to debug weather lookups without logging a home address. */
 private fun coarse(v: Double): String = String.format(java.util.Locale.US, "%.1f", v)
 
+// =============================================================================
+// Layout constants. Ratios are fractions of the display width so the face
+// scales across 396px / 450px watches; px values are absolute.
+// =============================================================================
+
+/** Sky bitmap edge as a multiple of the display; the margin is what parallax pans across. */
+private const val SKY_SCALE = 1.4f
+/** Logo width as a fraction of the display width. */
+private const val LOGO_WIDTH_RATIO = 0.6f
+
+/** Accelerometer delta (m/s²) that maps to full parallax travel. */
+private const val TILT_LIMIT = 2.5f
+/** Parallax travel in px per unit of tilt: sky moves most, logo a little, frame shadow opposite. */
+private const val DEPTH_SKY = 20f
+private const val DEPTH_LOGO = 3f
+private const val DEPTH_SHADOW = 5f
+/** Hand shadow offset in px, applied in the hand's own rotated frame (viewer-as-light-source). */
+private const val HAND_SHADOW_OFFSET = 6f
+private const val CENTER_CAP_SHADOW_OFFSET = 4f
+
+private const val TIME_TEXT_SIZE = 0.079f
+private const val TIME_Y_ABOVE_CENTER = 0.05f
+private const val DATE_TEXT_SIZE = 0.05f
+private const val DATE_Y_WITH_BATTERY = 0.08f
+private const val DATE_Y_ALONE = 0.11f          // also the ambient position
+private const val BATTERY_ICON_WIDTH = 0.04f
+private const val BATTERY_Y_WITH_DATE = 0.13f
+private const val BATTERY_Y_ALONE = 0.11f
+
+/** Low-pass factor for the accelerometer: smoothed = old*(1-a) + sample*a. */
+private const val SENSOR_SMOOTHING = 0.1f
+/** Tilt change (smoothed units) below which a sensor event doesn't trigger a redraw. */
+private const val REDRAW_TILT_THRESHOLD = 0.05f
+/** Minimum spacing between sensor-driven redraws (~30 fps cap). */
+private const val REDRAW_MIN_INTERVAL_MS = 33L
+
 class MyWatchFace : WatchFaceService() {
 
     companion object {
@@ -107,7 +143,6 @@ class MyWatchFace : WatchFaceService() {
 
         // Animation Configuration
         private const val FRAME_DURATION_MS = 180L
-        private const val LOGO_SCALE_FACTOR = 0.6f
 
         // --- User Preferences (Toggles) ---
         @Volatile private var showTime: Boolean = true
@@ -270,6 +305,10 @@ class MyWatchFace : WatchFaceService() {
         // before hands/frame are decoded gets cached as the face's image.
         private val staticAssetsLock = Any()
         @Volatile private var staticAssetsLoaded = false
+        // Set under staticAssetsLock by onDestroy. scope.cancel() cannot interrupt
+        // a decode already running on IO; without this flag that decode would
+        // finish after teardown and assign bitmaps nobody recycles.
+        @Volatile private var destroyed = false
 
         // --- Sensor State ---
         private var gyroX = 0f
@@ -817,7 +856,7 @@ class MyWatchFace : WatchFaceService() {
          * compounding scale operations.
          */
         private fun loadStaticResources() = synchronized(staticAssetsLock) {
-            if (staticAssetsLoaded) return@synchronized
+            if (staticAssetsLoaded || destroyed) return@synchronized
             fun decode(resId: Int): Bitmap? = try {
                 BitmapFactory.decodeResource(res, resId, null)
             } catch (e: Exception) {
@@ -871,8 +910,7 @@ class MyWatchFace : WatchFaceService() {
          * centered placement and parallax offset behave deterministically.
          */
         private fun getScaledBackground(src: Bitmap, width: Int, height: Int): Bitmap {
-            val scaleFactor = 1.4f
-            val targetSize = (Math.max(width, height) * scaleFactor).toInt()
+            val targetSize = (Math.max(width, height) * SKY_SCALE).toInt()
             if (src.width == targetSize && src.height == targetSize) return src
 
             val scale = Math.max(
@@ -946,7 +984,7 @@ class MyWatchFace : WatchFaceService() {
             // Always rescale from the *Src original — never from a previously
             // scaled result — so repeated bounds changes don't compound losses.
             logoBitmapSrc?.let { src ->
-                val targetWidth = (width * LOGO_SCALE_FACTOR).toInt()
+                val targetWidth = (width * LOGO_WIDTH_RATIO).toInt()
                 val targetHeight = (src.height * (targetWidth.toFloat() / src.width)).toInt()
                 val old = logoBitmap
                 logoBitmap = ensureScaled(src, targetWidth, targetHeight)
@@ -1021,11 +1059,6 @@ class MyWatchFace : WatchFaceService() {
         }
 
         private fun drawInteractive(canvas: Canvas, zonedDateTime: ZonedDateTime) {
-            val TILT_LIMIT = 2.5f
-            val DEPTH_SKY = 20f
-            val DEPTH_LOGO = 3f
-            val DEPTH_SHADOW = 5f
-            val HAND_SHADOW_OFFSET = 6f
             val diffX = (gyroX - baseX).coerceIn(-TILT_LIMIT, TILT_LIMIT)
             val diffY = (gyroY - baseY).coerceIn(-TILT_LIMIT, TILT_LIMIT)
 
@@ -1114,12 +1147,12 @@ class MyWatchFace : WatchFaceService() {
             canvas.restore()
 
             centerUnderBitmap?.let {
-                drawBitmapAt(canvas, it, 4f, 4f, shadowPaint)
+                drawBitmapAt(canvas, it, CENTER_CAP_SHADOW_OFFSET, CENTER_CAP_SHADOW_OFFSET, shadowPaint)
                 drawBitmapAt(canvas, it, 0f, 0f, handPaint)
             }
 
             centerOverBitmap?.let {
-                drawBitmapAt(canvas, it, 4f, 4f, shadowPaint)
+                drawBitmapAt(canvas, it, CENTER_CAP_SHADOW_OFFSET, CENTER_CAP_SHADOW_OFFSET, shadowPaint)
                 drawBitmapAt(canvas, it, 0f, 0f, handPaint)
             }
 
@@ -1147,13 +1180,13 @@ class MyWatchFace : WatchFaceService() {
             }
             if (showTime) {
                 digitalTextPaint.typeface = getTypefaceFor(timeWeightId)
-                digitalTextPaint.textSize = currentWidth * 0.079f
+                digitalTextPaint.textSize = currentWidth * TIME_TEXT_SIZE
                 val formatter = if (showSeconds) timeFormatterSeconds else timeFormatterNoSeconds
                 val timeText = zonedDateTime.format(formatter)
                 canvas.drawText(
                     timeText,
                     screenCenterX,
-                    screenCenterY - (currentWidth * 0.05f),
+                    screenCenterY - (currentWidth * TIME_Y_ABOVE_CENTER),
                     digitalTextPaint
                 )
             }
@@ -1161,11 +1194,11 @@ class MyWatchFace : WatchFaceService() {
             if (showBattery) {
                 digitalTextPaint.typeface = getTypefaceFor(batteryWeightId)
 
-                val batteryWidth = currentWidth * 0.04f
+                val batteryWidth = currentWidth * BATTERY_ICON_WIDTH
                 val batteryY = if (showDate) {
-                    screenCenterY + (currentWidth * 0.13f)
+                    screenCenterY + (currentWidth * BATTERY_Y_WITH_DATE)
                 } else {
-                    screenCenterY + (currentWidth * 0.11f)
+                    screenCenterY + (currentWidth * BATTERY_Y_ALONE)
                 }
                 drawBatteryBar(canvas, screenCenterX, batteryY, batteryWidth)
             }
@@ -1188,15 +1221,13 @@ class MyWatchFace : WatchFaceService() {
                     }
                 }
                 typeface = getTypefaceFor(dateWeightId)
-                textSize = currentWidth * 0.05f
+                textSize = currentWidth * DATE_TEXT_SIZE
             }
             val dateText = zonedDateTime.format(dateFormatter)
-            val dateY = if (isAmbient) {
-                screenCenterY + (currentWidth * 0.11f)
-            } else if (!showBattery) {
-                screenCenterY + (currentWidth * 0.11f)
+            val dateY = if (isAmbient || !showBattery) {
+                screenCenterY + (currentWidth * DATE_Y_ALONE)
             } else {
-                screenCenterY + (currentWidth * 0.08f)
+                screenCenterY + (currentWidth * DATE_Y_WITH_BATTERY)
             }
             canvas.drawText(dateText, screenCenterX, dateY, dateTextPaint)
         }
@@ -1353,8 +1384,8 @@ class MyWatchFace : WatchFaceService() {
                 baseY = y
                 needsReset = false
             }
-            gyroX = gyroX * 0.9f + x * 0.1f
-            gyroY = gyroY * 0.9f + y * 0.1f
+            gyroX = gyroX * (1f - SENSOR_SMOOTHING) + x * SENSOR_SMOOTHING
+            gyroY = gyroY * (1f - SENSOR_SMOOTHING) + y * SENSOR_SMOOTHING
 
             // Only repaint when tilt meaningfully changed and at most ~30Hz.
             // Eliminates the previous ~50Hz invalidate flood when the wrist
@@ -1362,7 +1393,9 @@ class MyWatchFace : WatchFaceService() {
             val dx = Math.abs(gyroX - lastInvalidatedGyroX)
             val dy = Math.abs(gyroY - lastInvalidatedGyroY)
             val now = System.currentTimeMillis()
-            if ((dx > 0.05f || dy > 0.05f) && now - lastSensorInvalidateAt > 33L) {
+            if ((dx > REDRAW_TILT_THRESHOLD || dy > REDRAW_TILT_THRESHOLD) &&
+                now - lastSensorInvalidateAt > REDRAW_MIN_INTERVAL_MS
+            ) {
                 lastInvalidatedGyroX = gyroX
                 lastInvalidatedGyroY = gyroY
                 lastSensorInvalidateAt = now
@@ -1381,25 +1414,24 @@ class MyWatchFace : WatchFaceService() {
             }
             scope.cancel()
 
-            // Resource Cleanup to prevent memory leaks (recycle() is idempotent,
-            // so sky/skySrc sharing an instance on 450px displays is fine)
-            currentBackgroundBitmap = null
-            sky.values.forEach { it.recycle() }
-            skySrc.values.forEach { it.recycle() }
-            synchronized(rainFrames) { rainFrames.forEach { it.recycle() } }
-            synchronized(snowFrames) { snowFrames.forEach { it.recycle() } }
-            logoBitmap?.recycle()
-            frameCenter?.recycle()
-            hourHandBitmap?.recycle()
-            minuteHandBitmap?.recycle()
-            centerUnderBitmap?.recycle()
-            centerOverBitmap?.recycle()
-            logoBitmapSrc?.recycle()
-            frameCenterSrc?.recycle()
-            hourHandBitmapSrc?.recycle()
-            minuteHandBitmapSrc?.recycle()
-            centerUnderBitmapSrc?.recycle()
-            centerOverBitmapSrc?.recycle()
+            // Resource cleanup. Taking staticAssetsLock means a decode that is
+            // still running on IO finishes (and its results are assigned) before
+            // we recycle, and any load that hasn't started yet sees `destroyed`.
+            // recycle() is idempotent, so sky/skySrc sharing an instance is fine.
+            synchronized(staticAssetsLock) {
+                destroyed = true
+                currentBackgroundBitmap = null
+                sky.values.forEach { it.recycle() }
+                skySrc.values.forEach { it.recycle() }
+                synchronized(rainFrames) { rainFrames.forEach { it.recycle() } }
+                synchronized(snowFrames) { snowFrames.forEach { it.recycle() } }
+                listOf(
+                    logoBitmap, frameCenter, hourHandBitmap, minuteHandBitmap,
+                    centerUnderBitmap, centerOverBitmap,
+                    logoBitmapSrc, frameCenterSrc, hourHandBitmapSrc, minuteHandBitmapSrc,
+                    centerUnderBitmapSrc, centerOverBitmapSrc
+                ).forEach { it?.recycle() }
+            }
         }
     }
 }
